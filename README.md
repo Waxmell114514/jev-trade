@@ -335,6 +335,10 @@ The API key stays in the server process; the browser never sees it. Without a
 key the page runs the offline simulator and says so. `?static=1` renders one
 snapshot instead of holding the stream open, and `?theme=light` forces a mode.
 
+`tools/record_session.py` captures a run's event stream to JSON, which is how
+the shareable replay of a real session was built — 199 live decisions, three of
+which came back past the deadline and were dropped.
+
 ## Real market data
 
 ```bash
