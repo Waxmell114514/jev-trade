@@ -386,6 +386,78 @@ def cmd_mm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_news(args: argparse.Namespace) -> int:
+    """Measure the assumption the market-making experiment rests on."""
+    from .news.feeds import collect
+    from .news.label import fetch_bars, label
+    from .news.study import crux, jev_scores, keyword_hit, score_arm
+
+    headlines, errors = collect()
+    bars = fetch_bars(interval=args.interval)
+    rows = label(headlines, bars, horizon_bars=args.horizon)
+    if not rows:
+        print("no headlines fell inside the available price history", file=sys.stderr)
+        return 1
+
+    window_h = (rows[-1].headline.ts - rows[0].headline.ts) / 3600
+    print(
+        f"{len(rows)} headlines over {window_h:.0f}h from "
+        f"{len(collect.__globals__['FEEDS']) - len(errors)} feeds, "
+        f"against {args.interval}m BTC bars (sigma {bars.sigma * 1e4:.1f} bp)"
+    )
+    if errors:
+        print(f"  feeds that failed: {', '.join(errors)}")
+
+    client = resolve_client(args.provider)
+    scores = jev_scores(rows, client)
+    order = sorted(range(len(rows)), key=lambda i: -scores[i])
+    keyword = [r for r in rows if keyword_hit(r.headline.title)]
+    top = [rows[i] for i in order[: args.top]]
+
+    print(
+        f"\nHow often is a headline followed by a >={args.threshold} sigma move in the next "
+        f"{args.horizon * args.interval} min,\nwithout one already underway? "
+        f"'null' is randomly timed fake headlines."
+    )
+    print(f"\n{'arm':<20}{'alerts':>8}{'fire':>7}{'moved':>7}{'null':>8}{'z':>7}")
+    print("-" * 57)
+    for name, selected in (
+        ("all headlines", rows),
+        ("keyword rule", keyword),
+        (f"jev top-{args.top}", top),
+    ):
+        result = score_arm(
+            name, selected, rows, bars,
+            threshold=args.threshold, horizon_bars=args.horizon,
+        )
+        print(
+            f"{name:<20}{result.selected:>8}{result.fire_rate:>6.0%}"
+            f"{result.rate:>7.1%}{result.null_rate:>8.1%}{result.z:>+7.2f}"
+        )
+
+    span = (rows[0].headline.ts, rows[-1].headline.ts)
+    print(
+        "\nThe crux: does a headline predict movement once the tape's own recent"
+        "\nvolatility is held fixed? Controls are drawn from moments with a"
+        "\ncomparable move already behind them."
+    )
+    print(f"\n{'group':<14}{'condition':<17}{'n':>5}{'after':>8}{'null':>8}{'z':>7}")
+    print("-" * 59)
+    for name, selected in ((f"jev top-{args.top}", top), ("keyword", keyword)):
+        for row in crux(selected, bars, span, group=name):
+            print(
+                f"{row.group:<14}{row.condition:<17}{row.n:>5}{row.after:>8.2f}"
+                f"{row.null:>8.2f}{row.z:>+7.2f}"
+            )
+
+    print("\nhighest-risk headlines as Jev read them:")
+    for i in order[:6]:
+        row = rows[i]
+        moved = "moved" if row.clean_mover(args.threshold) else "  -  "
+        print(f"  {scores[i]:.3f} {moved}  {row.headline.title[:66]}")
+    return 0
+
+
 def _as_json(result: EngineResult, metrics: Metrics) -> dict[str, Any]:
     payload = asdict(metrics)
     payload["calibration"] = [asdict(b) for b in metrics.calibration]
@@ -471,6 +543,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="0 makes every headline cosmetic (the falsifiability run)")
     mm.add_argument("--risk-floor", type=float, default=0.12)
     mm.set_defaults(func=cmd_mm)
+
+    news = sub.add_parser("news", help="does real news flow carry tradeable signal?")
+    news.add_argument("--provider", default="auto", choices=("auto", "jev", "mock"))
+    news.add_argument("--interval", type=int, default=5, help="price bar minutes")
+    news.add_argument("--horizon", type=int, default=3, help="bars after a headline")
+    news.add_argument("--threshold", type=float, default=2.0, help="sigmas = 'moved'")
+    news.add_argument("--top", type=int, default=40, help="headlines jev flags")
+    news.set_defaults(func=cmd_news)
 
     models = sub.add_parser("models", help="list models (needs an API key)")
     models.set_defaults(func=cmd_models)

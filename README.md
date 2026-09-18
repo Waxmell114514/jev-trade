@@ -468,9 +468,10 @@ toward precision — more news means more *material* news too.
 ### What this does not show
 
 - **The world is built so that semantics matter.** Denials and re-reports are
-  55% of the event mix by construction. Whether real headlines distribute like
-  this is the question that decides the whole thesis, and this repo does not
-  answer it.
+  55% of the event mix by construction. Measured against real feeds (see the
+  next section) the real figure is closer to 95% non-material — noisier than
+  assumed, which favours precision, but on a feed with no forward signal left
+  in it.
 - **The "subtle" labels are fiat.** Four headlines are written to read as
   immaterial while the simulator moves the price 22 bp anyway. Jev reads them
   as immaterial — as would a person. Most of the recall gap is these, so it may
@@ -482,6 +483,95 @@ toward precision — more news means more *material* news too.
 - Fills, impact and flow are a model, not an exchange. No queue position, no
   cancel latency, no fee tiers or rebates — and rebates are most of why real
   market making works.
+
+## Does real news flow look like that? (measured)
+
+The market-making experiment rests on one assumption: that a useful share of
+real headlines are the kind a keyword rule misreads. That is testable, and
+unlike the synthetic world it has a ground truth nobody has to label — **what
+the price actually did afterwards**.
+
+```bash
+python -m jevtrade.cli news
+```
+
+209 de-duplicated headlines from 11 public crypto RSS feeds over 58 hours,
+aligned to 5-minute BTC bars. A headline "moved" if BTC made a ≥2σ excursion in
+the next 15 minutes *and* was not already moving in the 15 before — because a
+move already underway is one you are too late to trade. The control throughout
+is **randomly timed fake headlines** over the same window.
+
+```
+arm                   alerts   fire  moved    null      z
+all headlines            209  100%   5.7%    5.0%   +0.47
+keyword rule              67   32%   9.0%    5.1%   +1.37
+jev top-40                40   19%   2.5%    5.0%   -0.74
+```
+
+Nothing clears the noise. Crypto headlines as a class are followed by a
+material move about as often as a randomly chosen moment is.
+
+### The crux
+
+That comparison is not yet decisive, because news clusters around busy moments
+and a busy moment stays busy on its own. So the real test holds recent
+volatility fixed: each flagged headline is compared against random moments with
+a comparable move already behind them.
+
+```
+group         condition            n   after    null      z
+jev top-40    quiet before        27    0.51    0.53   -0.22
+jev top-40    already moving      13    1.71    0.79   +4.12
+keyword       quiet before        41    0.55    0.53   +0.30
+keyword       already moving      26    1.28    0.78   +3.21
+```
+
+**A headline arriving into a quiet tape predicts nothing** — z ≈ 0 for both
+arms, and this is the well-controlled half of the table. The "already moving"
+rows look strong, but those are headlines *reporting* a move in progress, and
+the volatility matching there is coarse enough that the number is not evidence
+of anything.
+
+The qualitative read tells the same story. Jev's highest-risk headlines are
+exactly the ones a person would pick out:
+
+```
+0.268   SEC releases long-awaited innovation exemption
+0.259   Fed Hikes Rates for the First Time Since 2023, Bitcoin Spikes
+0.196   Binance Alert: System Upgrade to Suspend Deposits and Withdrawals
+0.176   Bank of Japan Follows Fed and ECB With Rate Hike to 1.25%
+```
+
+The second one says it outright. By the time an article about a Fed decision is
+written, edited and published to RSS, the spike it describes is history.
+
+### What this settles, and what it does not
+
+**The distribution assumption is half right, in the direction that matters.**
+Real flow is far noisier than the simulation assumed — roughly 95% of headlines
+are followed by nothing, against 55% non-material in the synthetic mix. That
+pushes the operating point deep into the regime where precision beats recall,
+which is exactly where Jev won and the keyword rule bled (−4% versus −32%). On
+this feed a keyword rule fires on **32%** of everything, so at a ~5% base rate
+at least six of every seven alerts are false by arithmetic alone.
+
+**But the premise underneath it does not survive as stated.** There is no
+tradeable forward signal here to be precise about. Jev reads the headlines
+correctly — its risk scores top out at 0.27, i.e. it judges almost nothing on
+this feed to be materially BTC-moving, which the tape agrees with — and reading
+them correctly is worth nothing when the information has already been priced.
+
+The likely culprit is the data source, not the model. RSS publication
+timestamps trail the underlying event by minutes; news desks that trade on
+headlines use millisecond-stamped wire feeds. So the honest scope of this
+result is: **consumer crypto RSS carries no tradeable forward information at
+5-minute resolution.** It is not a finding about news in general.
+
+Other limits worth holding onto: 209 headlines over one quiet 58-hour window is
+a small sample and underpowered for rare events; 5-minute bars are coarse for a
+reaction that happens in seconds; and only BTC was tested. Settling this
+properly needs a low-latency wire feed with millisecond stamps and an L2 book —
+which is the experiment to run before building anything on this idea.
 
 ## Real market data
 
@@ -501,7 +591,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 117 tests
+python -m pytest -q      # 133 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -532,6 +622,9 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `mm/questions.py` | the six headline questions |
 | `mm/strategies.py` | the four arms |
 | `mm/metrics.py` | markout decomposition |
+| `news/feeds.py` | real headlines from 11 public RSS feeds |
+| `news/label.py` | labels each headline by what the tape did next |
+| `news/study.py` | the null controls and the crux test |
 
 TypeSafe also ships first-party SDKs (`pip install typesafe-sdk`,
 `@typesafe-ai/sdk`). This repo speaks HTTP directly so the wire format stays

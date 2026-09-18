@@ -115,6 +115,33 @@ class KeywordStrategy(Strategy):
         )
 
 
+def headline_risk(response) -> float:
+    """How much this headline should worry a market maker, in 0..1.
+
+    Shared by the trading arm and the news study so both score a headline the
+    same way.
+
+    Deliberately not a plain product of four probabilities -- that lands near
+    zero for everything and no threshold can separate the cases. "Would it
+    move, and how much" carries the weight; the other two are discounts on it:
+
+    * a report that the event did *not* happen is near-dispositive, however
+      alarming its vocabulary (the model separates these cleanly, returning
+      p(denied) ~ 0.99 on denials and ~0.00 on real events);
+    * staleness discounts rather than annihilates, since a recap of real news
+      can still matter a little.
+
+    One-sided flow with no headline at all is its own reason to be careful, so
+    it sets a floor.
+    """
+    moves = response.noul(MOVES_PRICE).noul
+    severity = response.score(SEVERITY).normalized
+    freshness = 0.2 + 0.8 * response.noul(NEW_INFORMATION).noul
+    denial_discount = 1.0 - 0.93 * response.choice(REPORT_TYPE).p(DENIED)
+    risk = moves * severity * freshness * denial_discount
+    return max(risk, 0.85 * response.noul(INFORMED_FLOW).noul)
+
+
 @dataclass
 class JevConfig:
     ttl: int = 14
@@ -226,26 +253,7 @@ class JevStrategy(Strategy):
         severity = response.score(SEVERITY).normalized
         direction = response.choice(DIRECTION)
         report = response.choice(REPORT_TYPE)
-
-        # A denial is not the event. This single term is what the keyword rule
-        # has no way to express.
-        # Near-dispositive on purpose: a report that the event did *not* happen
-        # is not the event, however alarming its vocabulary. Safe to lean on,
-        # because the model separates the two cleanly -- denials come back at
-        # p(denied) ~ 0.99 and real events at ~0.00.
-        denial_discount = 1.0 - 0.93 * report.p(DENIED)
-        # Staleness discounts rather than annihilates: a recap of real news can
-        # still matter a little.
-        freshness = 0.2 + 0.8 * fresh
-
-        # Deliberately not a plain product of four probabilities -- that lands
-        # near zero for everything and no threshold can separate the cases.
-        # "Would it move, and how much" carries the weight; the other two are
-        # discounts on it.
-        risk = moves * severity * freshness * denial_discount
-        # The tape can speak on its own: one-sided flow with no headline at all
-        # is still a reason to be careful.
-        risk = max(risk, 0.85 * informed)
+        risk = headline_risk(response)
         detail = {
             "moves": round(moves, 3), "fresh": round(fresh, 3),
             "severity": round(severity, 3), "informed": round(informed, 3),
