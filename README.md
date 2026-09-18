@@ -573,6 +573,91 @@ reaction that happens in seconds; and only BTC was tested. Settling this
 properly needs a low-latency wire feed with millisecond stamps and an L2 book —
 which is the experiment to run before building anything on this idea.
 
+## Composed judgment: reading an announcement in one second
+
+The news study above put Jev on the wrong end of a trade-off. A headline that
+moves the market is rare and worth a lot, so whoever trades it can afford
+five seconds and five cents of a frontier model; a 400 ms answer buys nothing
+there. Jev's advantage — frontier-grade judgment, cheap, fast — pays where
+there are *many* judgments to make and each one is worth little. And, as it
+turns out, where several of them have to be composed.
+
+### Width is free, depth costs a round trip (measured)
+
+Against the real API, from this sandbox, with a ~1k-token document:
+
+```
+questions per request      median latency
+   1                          412 ms
+   6                          420 ms
+  24                          392 ms
+
+5 sequential rounds × 6 questions, each round given the previous answers:
+  2.0–2.4 s, about 400 ms per round
+```
+
+Ten judgments cost the same as one if they share a request. The budget is
+therefore *rounds* — conditional layers, "ask A, then depending on A ask B" —
+not judgments. One second buys two rounds from here and perhaps three to five
+from a colocated box, each carrying dozens of questions. So a judgment tree
+built on this model should be **wide and shallow**, which is also what keeps
+errors from compounding: ten sequential 90%-accurate steps are 35% accurate,
+two wide ones are not.
+
+### The opportunity: exchange listing announcements
+
+Binance publishes listings, delistings and every other notice through one
+public CMS endpoint with a millisecond `releaseDate` — the same endpoint the
+public "listing sniper" bots poll. Those bots are fast enough. What they cannot
+do is read: they match the title (`Will List`, `Removal`) and trade every
+ticker in it. That fails on exactly the announcements that carry the most
+money — three tickers where one is the subject, a pair removal that is not a
+delisting, a "Will Remove the Seed Tag" that the word `remove` turns into a
+short, a Seagate `(STX)` that buys Stacks.
+
+`jevtrade/listing/` reads each announcement with a two-round tree:
+
+* **Round one, wide and speculative:** what kind of notice is this (listing,
+  more markets for an existing token, delisting, warning tag, housekeeping,
+  tokenized stock), which way it cuts, how big, is it conditional — and, for
+  every ticker the *code* found in the text, whether that ticker is what the
+  announcement is about rather than a quote currency, collateral or a passing
+  mention. Jev never returns a string, so extraction is code and judgment is
+  the model.
+* **Round two, only if a ticker cleared that bar:** the direction for each
+  such token specifically, a reversed-framing check ("would a holder have no
+  reason to act?") whose errors are partly independent of the first framing,
+  and whether the substance was already public. No second round, no trade.
+
+Every number is arithmetic on the model's probabilities; the model computes
+nothing. On six recent, deliberately varied announcements against the real
+API the reader took **0.89–0.97 s** for two rounds (0.45 s when it stopped
+after one), on 2–4k input tokens — about $0.0001 per announcement.
+
+### How it will be graded
+
+```bash
+python -m jevtrade.cli listing --days 180            # real key: reads with Jev
+python -m jevtrade.cli listing --days 30 --provider mock
+```
+
+Every arm turns an announcement into (token, side) signals and every signal is
+scored the same way: enter at the open of the minute *after* the release —
+deliberately up to 59 seconds late for a reader that answers in one — and
+take the signed log return at 1, 5, 15 and 60 minutes, on Binance if the
+token still trades there, else OKX, else Coinbase, in that fixed order for
+every arm. The null is the same tokens and sides at random moments within
+five days, so whatever drift those tokens had that week the null has too. The
+release minute itself is reported but never credited to anyone.
+
+Three controls sit beside the reader: the title-matching bot (the incumbent),
+the same rules over tickers from the body as well (so that *seeing* the body
+and *judging* it are separable), and every mentioned ticker bought (the base
+rate for being mentioned at all). Model answers are cached on disk per
+announcement, so the threshold sweep and every re-run score one fixed set of
+answers rather than re-sampling the model. The run has not been done yet; the
+numbers will go here when it has.
+
 ## Real market data
 
 ```bash
@@ -591,7 +676,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 133 tests
+python -m pytest -q      # 162 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -625,6 +710,12 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `news/feeds.py` | real headlines from 11 public RSS feeds |
 | `news/label.py` | labels each headline by what the tape did next |
 | `news/study.py` | the null controls and the crux test |
+| `listing/announcements.py` | Binance's CMS feed, millisecond-stamped |
+| `listing/tickers.py` | candidate tickers, found by code |
+| `listing/reader.py` | the two-round judgment tree |
+| `listing/baseline.py` | the title-matching sniper bot |
+| `listing/venues.py` | 1-minute candles from Binance, OKX or Coinbase |
+| `listing/study.py` | entry rule, horizons, matched null, arms |
 
 TypeSafe also ships first-party SDKs (`pip install typesafe-sdk`,
 `@typesafe-ai/sdk`). This repo speaks HTTP directly so the wire format stays

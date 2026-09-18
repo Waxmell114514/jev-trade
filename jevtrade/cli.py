@@ -458,6 +458,154 @@ def cmd_news(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_listing(args: argparse.Namespace) -> int:
+    """Read exchange announcements in one second; let the tape grade every arm."""
+    import os
+    import statistics
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from .listing import study as S
+    from .listing.announcements import CATALOGS, collect
+    from .listing.reader import Reader
+    from .listing.store import Store
+
+    store = Store(args.cache)
+    catalogs = tuple(int(c) for c in args.catalogs.split(","))
+    horizons = tuple(int(h) for h in args.horizons.split(","))
+    since = time.time() - args.days * 86400
+    announcements = collect(store, since=since, catalogs=catalogs)
+    if args.limit:
+        announcements = announcements[-args.limit:]
+    if not announcements:
+        print("no announcements in range", file=sys.stderr)
+        return 1
+    first, last = announcements[0].when, announcements[-1].when
+    print(
+        f"{len(announcements)} Binance announcements, {first:%Y-%m-%d} to {last:%Y-%m-%d}, "
+        f"catalogues: {', '.join(CATALOGS.get(c, str(c)) for c in catalogs)}"
+    )
+
+    def make_reader() -> Reader:
+        if args.provider == "mock" or (
+            args.provider == "auto" and not os.environ.get("TYPESAFE_API_KEY")
+        ):
+            from .listing.mock import MockListingClient
+
+            return Reader(MockListingClient())
+        return Reader(resolve_client(args.provider, timeout_s=20.0))
+
+    tag = "mock" if make_reader().client.provider == "mock" else "jev"
+    started = time.perf_counter()
+    readings = S.read_all(
+        announcements, make_reader, store=store if not args.no_reading_cache else None,
+        cache_tag=f"{tag}:v1", workers=args.workers,
+    )
+    provider = make_reader().client.provider
+    walls = sorted(r.wall_ms for r in readings)
+    print(
+        f"reader ({provider}): {len(readings)} announcements, "
+        f"{sum(r.rounds == 2 for r in readings)} went to round two, "
+        f"median {statistics.median(walls):.0f} ms per announcement "
+        f"(p90 {walls[int(0.9 * (len(walls) - 1))]:.0f} ms), "
+        f"${S.cost_usd(readings):.3f} of input tokens, "
+        f"{(time.perf_counter() - started):.0f}s wall for this run"
+    )
+
+    arms = [
+        ("title-bot", S.bot_signals(announcements, S.title_bot)),
+        ("body-bot", S.bot_signals(announcements, S.body_bot)),
+        (f"reader >={args.threshold:.2f}", S.reader_signals(readings, args.threshold)),
+        ("all mentions", S.mention_signals(announcements)),
+    ]
+    summaries: list[S.ArmSummary] = []
+    outcome_pool: list[S.Outcome] = []
+    for name, signals in arms:
+        outcomes = S.measure(store, signals, horizons=horizons, workers=args.workers_io)
+        nulls = S.measure(store, S.null_signals(outcomes, per=args.null_per),
+                          horizons=horizons, workers=args.workers_io)
+        summaries.append(S.summarize(name, signals, outcomes, nulls, horizons=horizons))
+        outcome_pool.extend(outcomes)
+
+    hz = "".join(f"{'+' + str(h) + 'm':>9}" for h in horizons)
+    print(
+        "\nSigned log return per signal, bps, entering at the open of the minute AFTER"
+        "\nthe announcement. 'pre' is the 15 min before it; 'bar' is the release minute"
+        "\nitself (what the fastest actors saw). z is against the same tokens and"
+        "\nsides at random moments within 5 days."
+    )
+    print(f"\n{'arm':<16}{'signals':>8}{'traded':>7}{'pre':>7}{'bar':>7}{hz}{'hit15':>7}{'z15':>7}")
+    print("-" * (16 + 8 + 7 + 7 + 7 + 9 * len(horizons) + 14))
+    for s in summaries:
+        cells = "".join(f"{s.fwd[h].mean:>+9.0f}" for h in horizons)
+        print(
+            f"{s.name:<16}{s.signals:>8}{s.measured:>7}{s.pre.mean:>+7.0f}"
+            f"{s.release_bar.mean:>+7.0f}{cells}{s.hit[15] if 15 in s.hit else 0:>7.0%}"
+            f"{s.z[15] if 15 in s.z else 0:>+7.1f}"
+        )
+        cells = "".join(f"{'+-' + format(s.fwd[h].se, '.0f'):>9}" for h in horizons)
+        null = "".join(f"{s.null[h].mean:>+9.0f}" for h in horizons)
+        print(f"{'  s.e.':<16}{'':>8}{'':>7}{'':>7}{'':>7}{cells}")
+        print(f"{'  null':<16}{'':>8}{'':>7}{'':>7}{'':>7}{null}")
+
+    print("\nreader threshold sweep (+15m, same cached answers):")
+    print(f"{'thr':>6}{'signals':>9}{'traded':>8}{'+15m':>8}{'s.e.':>7}{'null':>8}{'z':>7}")
+    for thr in (0.10, 0.15, 0.20, 0.25, 0.30, 0.40):
+        signals = S.reader_signals(readings, thr)
+        outcomes = S.measure(store, signals, horizons=(15,), workers=args.workers_io)
+        nulls = S.measure(store, S.null_signals(outcomes, per=args.null_per),
+                          horizons=(15,), workers=args.workers_io)
+        s = S.summarize(f"{thr}", signals, outcomes, nulls, horizons=(15,))
+        print(
+            f"{thr:>6.2f}{s.signals:>9}{s.measured:>8}{s.fwd[15].mean:>+8.0f}"
+            f"{s.fwd[15].se:>7.0f}{s.null[15].mean:>+8.0f}{s.z[15]:>+7.1f}"
+        )
+
+    kinds: dict[str, int] = {}
+    for r in readings:
+        kinds[r.event_type] = kinds.get(r.event_type, 0) + 1
+    print("\nwhat the reader thinks the feed is made of: " + ", ".join(
+        f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])
+    ))
+
+    diffs = S.disagreements(readings, args.threshold, outcome_pool)
+    diffs.sort(key=lambda d: -max([abs(v) for v in d.outcomes.values()] or [0.0]))
+    print(f"\nwhere matching the title and reading it traded differently ({len(diffs)} of {len(readings)}); +15m bps per token:")
+    for d in diffs[: args.show]:
+        when = datetime.fromtimestamp(d.when, timezone.utc)
+        fmt = lambda rows: ", ".join(f"{'long' if s > 0 else 'short'} {t}" for t, s in rows) or "nothing"  # noqa: E731
+        moves = ", ".join(f"{t} {v:+.0f}" for t, v in d.outcomes.items()) or "no tape"
+        print(f"  {when:%m-%d %H:%M} {d.title[:70]}")
+        print(f"      bot: {fmt(d.bot)[:70]}")
+        print(f"   reader: {fmt(d.reader)[:70]}")
+        print(f"     tape: {moves[:70]}")
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "provider": provider, "days": args.days, "catalogs": catalogs,
+            "threshold": args.threshold, "horizons": horizons,
+            "announcements": len(announcements),
+            "arms": [
+                {"name": s.name, "signals": s.signals, "measured": s.measured,
+                 "pre": asdict(s.pre), "release_bar": asdict(s.release_bar),
+                 "fwd": {h: asdict(v) for h, v in s.fwd.items()},
+                 "null": {h: asdict(v) for h, v in s.null.items()},
+                 "hit": s.hit, "z": s.z}
+                for s in summaries
+            ],
+            "readings": [
+                {"code": r.announcement.code, "ts": r.announcement.ts,
+                 "title": r.announcement.title, **S.reading_to_dict(r)}
+                for r in readings
+            ],
+        }, ensure_ascii=False, indent=1))
+        print(f"\nwrote {out}")
+    return 0
+
+
 def _as_json(result: EngineResult, metrics: Metrics) -> dict[str, Any]:
     payload = asdict(metrics)
     payload["calibration"] = [asdict(b) for b in metrics.calibration]
@@ -551,6 +699,23 @@ def build_parser() -> argparse.ArgumentParser:
     news.add_argument("--threshold", type=float, default=2.0, help="sigmas = 'moved'")
     news.add_argument("--top", type=int, default=40, help="headlines jev flags")
     news.set_defaults(func=cmd_news)
+
+    listing = sub.add_parser("listing", help="read exchange announcements in one second; the tape grades it")
+    listing.add_argument("--provider", default="auto", choices=("auto", "jev", "mock"))
+    listing.add_argument("--days", type=float, default=180.0)
+    listing.add_argument("--catalogs", default="48,161,49",
+                         help="Binance CMS catalogues: 48 listings, 161 delistings, 49 general news")
+    listing.add_argument("--threshold", type=float, default=0.25, help="reader signal strength to trade")
+    listing.add_argument("--horizons", default="1,5,15,60", help="minutes after entry")
+    listing.add_argument("--limit", type=int, default=0, help="only the most recent N announcements")
+    listing.add_argument("--cache", default=".cache/listing")
+    listing.add_argument("--no-reading-cache", action="store_true", help="ask the model again even if cached")
+    listing.add_argument("--workers", type=int, default=3, help="parallel model readers")
+    listing.add_argument("--workers-io", type=int, default=8, help="parallel candle fetches")
+    listing.add_argument("--null-per", type=int, default=2, help="random controls per measured signal")
+    listing.add_argument("--show", type=int, default=8, help="disagreements to print")
+    listing.add_argument("--out", default="", help="write a JSON record of the run")
+    listing.set_defaults(func=cmd_listing)
 
     models = sub.add_parser("models", help="list models (needs an API key)")
     models.set_defaults(func=cmd_models)
