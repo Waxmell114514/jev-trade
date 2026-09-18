@@ -279,6 +279,113 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mm(args: argparse.Namespace) -> int:
+    """Four arms, identical markets, measured by markout."""
+    import math
+    import statistics
+
+    from .mm.cache import CachingClient
+    from .mm.engine import run as mm_run
+    from .mm.market import MarketConfig
+    from .mm.metrics import evaluate as mm_evaluate
+    from .mm.strategies import (
+        JevConfig,
+        JevStrategy,
+        KeywordStrategy,
+        NaiveStrategy,
+        VolStrategy,
+    )
+
+    if args.provider == "mock":
+        from .mm.mock import MockHeadlineClient
+
+        client = MockHeadlineClient()
+    else:
+        try:
+            client = resolve_client(args.provider)
+        except JevError:
+            from .mm.mock import MockHeadlineClient
+
+            client = MockHeadlineClient()
+    # One fixed set of model answers across every arm and every market, so the
+    # comparison isolates the strategy rather than the model's sampling noise.
+    shared = CachingClient(client)
+
+    seeds = [args.first_seed + i for i in range(args.seeds)]
+    results: dict[str, list[float]] = {}
+    acted = on_material = material_seen = 0
+
+    for seed in seeds:
+        config = MarketConfig(
+            n_ticks=args.ticks,
+            seed=seed,
+            toxicity=args.toxicity,
+            event_rate_per_1000=args.event_rate,
+            event_impact_bps=args.event_impact_bps,
+        )
+        arms = (
+            ("naive", NaiveStrategy()),
+            ("vol", VolStrategy()),
+            ("keyword", KeywordStrategy()),
+            ("jev", JevStrategy(shared, JevConfig(risk_floor=args.risk_floor))),
+        )
+        for name, strategy in arms:
+            run_result = mm_run(strategy, market=config)
+            results.setdefault(name, []).append(
+                mm_evaluate(run_result).final_equity
+            )
+            if name != "jev":
+                continue
+            events = {e.seq: e for e in run_result.events}
+            for entry in run_result.posture_log:
+                event = events.get(entry["seq"])
+                if event is None:
+                    continue
+                material_seen += int(event.material)
+                if entry["stance"] != "normal":
+                    acted += 1
+                    on_material += int(event.material)
+
+    def stats(values: list[float]) -> tuple[float, float]:
+        mean = statistics.fmean(values)
+        err = (
+            statistics.pstdev(values) / math.sqrt(len(values))
+            if len(values) > 1
+            else 0.0
+        )
+        return mean, err
+
+    if shared.provider == "mock":
+        print(
+            "!! provider=mock -- the headline stub is a keyword matcher with no\n"
+            "!! language understanding, so the 'jev' arm here is roughly the\n"
+            "!! 'keyword' arm. Set TYPESAFE_API_KEY to measure the real model.\n"
+        )
+    print(
+        f"{len(seeds)} independent markets x {args.ticks:,} ticks  |  "
+        f"toxicity {args.toxicity}  events {args.event_rate}/1000  "
+        f"impact {args.event_impact_bps} bp"
+    )
+    print(f"\n{'arm':<10}{'mean net':>12}{'std error':>12}{'vs naive':>12}")
+    print("-" * 46)
+    base, _ = stats(results["naive"])
+    for name in ("naive", "vol", "keyword", "jev"):
+        mean, err = stats(results[name])
+        print(f"{name:<10}{mean:>12,.0f}{err:>12,.0f}{mean - base:>+12,.0f}")
+
+    paired = [j - k for j, k in zip(results["jev"], results["keyword"])]
+    diff, diff_err = stats(paired)
+    verdict = "inside the noise" if abs(diff) < 2 * diff_err else "outside the noise"
+    print(f"\npaired jev - keyword: {diff:+,.0f} +- {diff_err:,.0f}  ({verdict})")
+    if acted:
+        print(
+            f"jev precision {on_material / acted:.0%} "
+            f"({on_material}/{acted} stances on genuinely material news)   "
+            f"recall {on_material / max(material_seen, 1):.0%}"
+        )
+    return 0
+
+
 def _as_json(result: EngineResult, metrics: Metrics) -> dict[str, Any]:
     payload = asdict(metrics)
     payload["calibration"] = [asdict(b) for b in metrics.calibration]
@@ -350,6 +457,20 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--interval-min", type=int, default=1)
     fetch.add_argument("--out", default="data/ticks.csv")
     fetch.set_defaults(func=cmd_fetch)
+
+    mm = sub.add_parser("mm", help="market-making experiment (news + tape)")
+    mm.add_argument("--seeds", type=int, default=8, help="independent markets")
+    mm.add_argument("--first-seed", type=int, default=101)
+    mm.add_argument("--ticks", type=int, default=6000)
+    mm.add_argument("--provider", default="auto", choices=("auto", "jev", "mock"))
+    mm.add_argument("--toxicity", type=float, default=1.0,
+                    help="how much informed flow; 0 = nobody knows anything")
+    mm.add_argument("--event-rate", type=float, default=12.0,
+                    help="headlines per 1000 ticks")
+    mm.add_argument("--event-impact-bps", type=float, default=22.0,
+                    help="0 makes every headline cosmetic (the falsifiability run)")
+    mm.add_argument("--risk-floor", type=float, default=0.12)
+    mm.set_defaults(func=cmd_mm)
 
     models = sub.add_parser("models", help="list models (needs an API key)")
     models.set_defaults(func=cmd_models)

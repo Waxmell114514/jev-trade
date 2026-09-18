@@ -339,6 +339,150 @@ snapshot instead of holding the stream open, and `?theme=light` forces a mode.
 the shareable replay of a real session was built — 199 live decisions, three of
 which came back past the deadline and were dropped.
 
+## Market making: where this model actually fits
+
+The directional strategy above is the wrong job for Jev, and the numbers say so
+— a taker needs a sub-0.32 bp fee to survive, and predicting direction is the
+one thing a System One model is weakest at.
+
+Market making is the better fit, for a reason worth stating precisely. The
+mechanical part — quote both sides, earn the spread, lean against inventory —
+is arithmetic, and a traditional program does it better than any model. What
+kills a market maker is **adverse selection**: getting picked off by someone
+who knows something. Deciding *"is now a bad time to be showing this side"* is
+a defensive, low-cardinality judgment over text, and it has to be made in
+hundreds of milliseconds. That intersection is the niche: too semantic for a
+rule, too fast for a frontier model.
+
+```bash
+python -m jevtrade.cli mm --seeds 20                  # the comparison
+python -m jevtrade.cli mm --event-impact-bps 0        # the falsifiability run
+```
+
+### Jev goes off the quote path
+
+```
+quoting engine (pure code, every tick) ──> bid / ask
+        ▲ reads, never waits
+   risk posture  {per-side spread, per-side size, ttl}
+        ▲ lands ~400 ms later
+   Jev ◀── a headline arrives, or the tape turns one-sided
+```
+
+The quoter never blocks on a network call. Jev sets a *posture*; code sets
+quotes. This is what makes the latency budget survivable: a stale posture is
+merely conservative, while a stale directional bet is fatal. If the model is
+slow or down, the stance defaults to defensive.
+
+It also buys something a volatility trigger structurally cannot do. Knowing the
+direction lets you **pull the side about to be picked off and keep quoting the
+other** — protected and positioned at once. A vol spike has no direction, so it
+can only widen both sides.
+
+And uncertainty has a safe direction here, which it does not in directional
+trading. There, low confidence means stand aside and earn nothing. Here it
+means quote wider and keep earning. Calibrated confidence maps onto a continuum
+of profitable states rather than an on/off switch.
+
+### The experiment
+
+Four arms over identical markets — the price path and event schedule run on
+their own RNG stream, so every arm sees the same tape:
+
+| arm | what it does |
+|---|---|
+| `naive` | quotes through everything |
+| `vol` | widens both sides when realised vol spikes — the traditional defence |
+| `keyword` | pauses quoting on a news word — what desks actually run |
+| `jev` | reads the headline and the tape, sets a stance per side |
+
+Counterparties are a mix of **noise flow** (fill probability decays with quote
+distance) and **informed flow** (arrives after a material event, trades the way
+the price is about to move, and crosses only while the quote is cheap relative
+to the move it already knows about). Without that asymmetry a market-making
+backtest is meaningless — quoting a random walk always "wins".
+
+Scoring is by **markout**, the only measure that tells a market maker anything:
+each fill splits into the half-spread captured at the fill and what the mid did
+afterwards. The second term is adverse selection.
+
+The `keyword` arm is built to be a *strong* competitor: its dictionary catches
+all six obviously material headlines in both directions. Its only failures are
+the four deliberately subtle ones and the seven it cannot read — denials and
+re-reports. Beating a strawman would prove nothing.
+
+### Results
+
+20 independent markets, 6,000 ticks each, real `jev-latest`:
+
+```
+arm           mean net   std error    vs naive
+----------------------------------------------
+naive            1,755         767          +0
+vol              1,500         928        -255
+keyword          8,820         900      +7,066
+jev              5,829         752      +4,074
+
+paired jev - keyword: -2,991 +- 654  (outside the noise)
+jev precision 97%   recall 62%
+```
+
+**The keyword rule wins, and the gap is real.** Jev's reading is close to
+perfect — it flags 97% of its stances on genuinely material news, and in a
+separate check it scored `p(denied) = 0.99` on every denial and freshness
+`0.11` on every re-report — but it acts on only 62% of material events, and in
+this world a miss costs more than a false alarm.
+
+The falsifiability run makes the trade-off visible. Set `--event-impact-bps 0`
+so headlines print but the price never moves, and every defensive stance is
+pure cost:
+
+```
+naive           20,479          +0
+keyword         13,993      -6,486   (-32%)
+jev             19,689        -791   ( -4%)
+```
+
+Jev's false alarms cost **eight times less**. That is precision, measured.
+
+So there is a crossover, and it sits at how much of the flow is informed:
+
+```
+ toxicity    naive  keyword      jev   jev-kw   +-se  winner
+     0.00   20,333   19,092   20,828   +1,736    717  jev
+     0.25   15,183   16,876   16,725     -152    916  tie
+     0.50   11,303   13,462   12,083   -1,379    470  keyword
+     1.00    3,391   10,127    5,266   -4,861    778  keyword
+     1.50   -4,757    5,478     -885   -6,363  1,145  keyword
+```
+
+**Precision pays when false alarms dominate; recall pays once adverse selection
+does.** If your news feed is mostly noise, reading it is worth a lot. If every
+event is a real 20 bp move, pausing on everything is hard to beat.
+
+Two things that did *not* work, recorded because they were predictions:
+acting harder once the floor is cleared made things worse (the lost spread
+exceeds the protection), and raising the event rate did not tip the balance
+toward precision — more news means more *material* news too.
+
+### What this does not show
+
+- **The world is built so that semantics matter.** Denials and re-reports are
+  55% of the event mix by construction. Whether real headlines distribute like
+  this is the question that decides the whole thesis, and this repo does not
+  answer it.
+- **The "subtle" labels are fiat.** Four headlines are written to read as
+  immaterial while the simulator moves the price 22 bp anyway. Jev reads them
+  as immaterial — as would a person. Most of the recall gap is these, so it may
+  be an artifact of my labelling rather than a limit of the model.
+- **Jev is a sampler.** Re-drawing its answers moved a single configuration by
+  ~30%. Every number here fixes one set of answers across all arms and reports
+  a standard error across markets; treat differences smaller than ~2 standard
+  errors as nothing.
+- Fills, impact and flow are a model, not an exchange. No queue position, no
+  cancel latency, no fee tiers or rebates — and rebates are most of why real
+  market making works.
+
 ## Real market data
 
 ```bash
@@ -357,7 +501,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 89 tests
+python -m pytest -q      # 117 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -383,6 +527,11 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `live.py` | Kraken live top-of-book, real bid/ask and sizes |
 | `server.py` | the demo server: trading loop + SSE |
 | `web/index.html` | the demo page |
+| `mm/market.py` | quoting sim with informed (toxic) flow |
+| `mm/events.py` | synthetic headlines + the keyword competitor |
+| `mm/questions.py` | the six headline questions |
+| `mm/strategies.py` | the four arms |
+| `mm/metrics.py` | markout decomposition |
 
 TypeSafe also ships first-party SDKs (`pip install typesafe-sdk`,
 `@typesafe-ai/sdk`). This repo speaks HTTP directly so the wire format stays

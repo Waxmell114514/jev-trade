@@ -166,16 +166,18 @@ class HttpJevClient:
         ).rstrip("/")
         self.timeout_s = timeout_s
         self.retry = retry or RetryPolicy()
-        self._questions = questions
+        # Public: a caller with a different job (the market-making loop asks a
+        # different set) swaps this rather than reaching into the client.
+        self.questions = questions
         self._rng = random.Random(0)
 
     # The question map is static, so build it once per client.
     def _question_map(self) -> dict[str, Any]:
-        if self._questions is None:
+        if self.questions is None:
             from ..questions import trading_questions
 
-            self._questions = trading_questions()
-        return self._questions
+            self.questions = trading_questions()
+        return self.questions
 
     def evaluate(self, state: dict[str, Any]) -> JevResponse:
         body = {
