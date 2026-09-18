@@ -152,7 +152,10 @@ class HttpJevClient:
         retry: RetryPolicy | None = None,
         questions: dict[str, Any] | None = None,
     ) -> None:
-        self.api_key = api_key or os.environ.get(API_KEY_ENV, "")
+        # Keys routinely arrive from a .env file written on Windows, and the
+        # trailing \r makes an unusable header with a baffling error deep in
+        # http.client. Strip it here instead.
+        self.api_key = (api_key or os.environ.get(API_KEY_ENV, "")).strip()
         if not self.api_key:
             raise JevAuthError(
                 f"no API key: set {API_KEY_ENV} or pass api_key explicitly"

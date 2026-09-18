@@ -200,3 +200,16 @@ def test_mock_still_receives_its_own_options(monkeypatch):
     client = resolve_client("auto", latency_ms=7.0)
     assert isinstance(client, MockJevClient)
     assert client.latency_ms == 7.0
+
+
+def test_api_key_whitespace_is_stripped(monkeypatch):
+    """A key pasted from a CRLF .env must not produce an invalid HTTP header."""
+    monkeypatch.setenv("TYPESAFE_API_KEY", "sk-test\r\n")
+    assert HttpJevClient().api_key == "sk-test"
+    assert HttpJevClient(api_key="  sk-spaced  ").api_key == "sk-spaced"
+
+
+def test_blank_api_key_is_treated_as_missing(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "   ")
+    with pytest.raises(JevAuthError):
+        HttpJevClient()
