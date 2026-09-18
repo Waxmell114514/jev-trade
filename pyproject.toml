@@ -1,0 +1,23 @@
+[project]
+name = "jev-trade"
+version = "0.1.0"
+description = "A simulated high-frequency crypto trading loop driven by TypeSafe AI's Jev System One model"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+sdk = ["typesafe-sdk>=0.6.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+jevtrade = "jevtrade.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["jevtrade*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
