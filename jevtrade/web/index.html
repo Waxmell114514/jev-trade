@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jev-trade live</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --surface-0: #111110;
+    --surface-1: #1a1a19;
+    --surface-2: #232321;
+    --hairline:  #333331;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #8a8980;
+    --series-1: #3987e5;   /* price, latency */
+    --buy:      #199e70;   /* aqua  */
+    --sell:     #d95926;   /* orange */
+    --warn:     #c98500;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --surface-0: #f4f4f1;
+    --surface-1: #fcfcfb;
+    --surface-2: #ffffff;
+    --hairline:  #e2e1dc;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #7a7973;
+    --series-1: #2a78d6;
+    --buy:      #1baf7a;
+    --sell:     #eb6834;
+    --warn:     #eda100;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--surface-0); color: var(--text-primary);
+    font-family: var(--sans); font-size: 14px; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 16px; }
+
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding-bottom: 12px; border-bottom: 1px solid var(--hairline); margin-bottom: 16px;
+  }
+  .brand { font-weight: 650; letter-spacing: -0.01em; }
+  .brand span { color: var(--text-muted); font-weight: 400; }
+  .sym { font-family: var(--mono); color: var(--text-secondary); }
+  .px { font-family: var(--mono); font-size: 22px; font-weight: 600;
+        font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .chg { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .spacer { flex: 1; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border: 1px solid var(--hairline); border-radius: 999px;
+    font-size: 12px; color: var(--text-secondary); font-family: var(--mono);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); }
+  .dot.on { background: var(--buy); }
+  .dot.think { background: var(--series-1); animation: pulse .7s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+  button.theme {
+    background: none; border: 1px solid var(--hairline); border-radius: 6px;
+    color: var(--text-secondary); padding: 4px 9px; cursor: pointer; font-size: 12px;
+  }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+           gap: 1px; background: var(--hairline); border: 1px solid var(--hairline);
+           border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+  .tile { background: var(--surface-1); padding: 10px 14px; }
+  .tile .k { font-size: 11px; color: var(--text-muted); text-transform: uppercase;
+             letter-spacing: .06em; margin-bottom: 4px; }
+  .tile .v { font-family: var(--mono); font-size: 19px; font-weight: 600;
+             font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .tile .v small { font-size: 12px; font-weight: 400; color: var(--text-muted); }
+  .tile.hero { background: var(--surface-2); }
+  .tile.hero .v { font-size: 26px; }
+
+  .budget { height: 4px; background: var(--hairline); border-radius: 2px;
+            margin-top: 7px; overflow: hidden; position: relative; }
+  .budget i { display: block; height: 100%; background: var(--series-1);
+              border-radius: 2px; transition: width .2s ease; }
+  .budget i.late { background: var(--sell); }
+
+  .grid { display: grid; grid-template-columns: minmax(0,1fr) 340px; gap: 16px; }
+  @media (max-width: 960px) { .grid { grid-template-columns: minmax(0,1fr); } }
+
+  .card { background: var(--surface-1); border: 1px solid var(--hairline);
+          border-radius: 8px; padding: 14px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 2px; font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
+  .card p.sub { margin: 0 0 12px; font-size: 12px; color: var(--text-muted); }
+
+  svg { display: block; width: 100%; overflow: visible; }
+  .gridline { stroke: var(--hairline); stroke-width: 1; }
+  .axis { fill: var(--text-muted); font-family: var(--mono); font-size: 10px; }
+  .price-line { fill: none; stroke: var(--series-1); stroke-width: 2;
+                stroke-linejoin: round; stroke-linecap: round; }
+  .price-area { fill: var(--series-1); opacity: .07; }
+  .mark { stroke: var(--surface-1); stroke-width: 2; }
+  .mark.buy  { fill: var(--buy); }
+  .mark.sell { fill: var(--sell); }
+  .poslin { fill: none; stroke: var(--text-secondary); stroke-width: 1.5;
+            stroke-linejoin: round; }
+  .crosshair { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: none; opacity: .5; }
+
+  .tip { position: fixed; pointer-events: none; z-index: 20; opacity: 0;
+         background: var(--surface-2); border: 1px solid var(--hairline);
+         border-radius: 6px; padding: 7px 10px; font-family: var(--mono);
+         font-size: 11px; line-height: 1.55; box-shadow: 0 6px 20px rgba(0,0,0,.35);
+         transition: opacity .1s; white-space: nowrap; }
+  .tip b { color: var(--text-primary); font-weight: 600; }
+  .tip span { color: var(--text-muted); }
+
+  .qrow { display: grid; grid-template-columns: 96px 1fr 52px; gap: 8px;
+          align-items: center; margin-bottom: 9px; }
+  .qname { font-size: 11px; color: var(--text-secondary); font-family: var(--mono); }
+  .qbar { height: 14px; background: var(--surface-0); border-radius: 3px;
+          display: flex; overflow: hidden; gap: 2px; }
+  .qbar i { display: block; height: 100%; }
+  .qval { font-family: var(--mono); font-size: 11px; text-align: right;
+          color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px;
+            color: var(--text-muted); font-family: var(--mono); margin-top: 2px; }
+  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+              margin-right: 4px; vertical-align: middle; }
+
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11px; }
+  th { text-align: left; color: var(--text-muted); font-weight: 400; padding: 3px 0;
+       border-bottom: 1px solid var(--hairline); text-transform: uppercase;
+       letter-spacing: .05em; font-size: 10px; }
+  td { padding: 4px 0; border-bottom: 1px solid var(--hairline);
+       font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+  td.side-buy  { color: var(--buy); }
+  td.side-sell { color: var(--sell); }
+  td.num { text-align: right; }
+
+  pre.state { margin: 0; font-family: var(--mono); font-size: 10.5px; line-height: 1.6;
+              color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
+              max-height: 300px; overflow-y: auto; }
+  pre.state b { color: var(--text-muted); font-weight: 400; }
+  pre.state em { color: var(--text-primary); font-style: normal; }
+  .note { font-size: 11px; color: var(--text-muted); line-height: 1.6; }
+  .err { color: var(--sell); font-family: var(--mono); font-size: 11px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">jev-trade <span>/ live</span></div>
+    <div class="sym" id="sym">—</div>
+    <div class="px" id="px">—</div>
+    <div class="chg" id="chg"></div>
+    <div class="spacer"></div>
+    <div class="badge"><span class="dot" id="statusDot"></span><span id="statusTxt">connecting</span></div>
+    <button class="theme" id="themeBtn">light</button>
+  </header>
+
+  <div class="tiles">
+    <div class="tile hero">
+      <div class="k">Jev latency</div>
+      <div class="v"><span id="lat">—</span><small> ms</small></div>
+      <div class="budget"><i id="budgetBar" style="width:0%"></i></div>
+    </div>
+    <div class="tile"><div class="k">p50 / p95</div><div class="v" id="pct">— / —</div></div>
+    <div class="tile"><div class="k">Decisions</div><div class="v" id="dec">0</div></div>
+    <div class="tile"><div class="k">Position</div><div class="v" id="pos">0</div></div>
+    <div class="tile"><div class="k">P&amp;L <small id="feeNote"></small></div><div class="v" id="pnl">0.00</div></div>
+    <div class="tile"><div class="k">API cost</div><div class="v" id="cost">$0.00</div></div>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2 id="chartTitle">BTC-USD mid price, live</h2>
+        <p class="sub">One point per snapshot. Markers are executed trades.</p>
+        <svg id="chart" viewBox="0 0 900 320" preserveAspectRatio="none" height="320"></svg>
+        <div class="legend">
+          <span><i style="background:var(--series-1)"></i>mid price</span>
+          <span><i style="background:var(--buy)"></i>▲ buy</span>
+          <span><i style="background:var(--sell)"></i>▼ sell</span>
+          <span><i style="background:var(--text-secondary)"></i>position</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Decision latency, one bar per call</h2>
+        <p class="sub" id="latSub">The rule line is the snapshot interval: a decision slower than
+          that describes a book that no longer exists, and is dropped.</p>
+        <svg id="latChart" viewBox="0 0 900 130" preserveAspectRatio="none" height="130"></svg>
+      </div>
+
+      <div class="card">
+        <h2>Executed trades</h2>
+        <p class="sub">Most recent first. Buys lift the ask, sells hit the bid.</p>
+        <table>
+          <thead><tr><th>time</th><th>side</th><th class="num">units</th><th class="num">price</th></tr></thead>
+          <tbody id="tradeBody"><tr><td colspan="4" style="color:var(--text-muted)">no trades yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>What Jev answered</h2>
+        <p class="sub" id="decSub">six typed questions, one request</p>
+        <div id="answers"></div>
+      </div>
+
+      <div class="card">
+        <h2>What Jev was shown</h2>
+        <p class="sub">The state, in words. No number ever reaches the model.</p>
+        <pre class="state" id="stateBox">waiting for the first decision…</pre>
+      </div>
+
+      <div class="card">
+        <h2>Run</h2>
+        <div class="note" id="runNote"></div>
+        <div class="err" id="errBox"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const fmt = (n, d = 2) => n === null || n === undefined || Number.isNaN(n)
+    ? "—" : n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+
+  const S = { history: [], trades: [], latencies: [], config: {}, stats: {}, decision: null };
+
+  // ?theme=light|dark forces a mode; otherwise the toggle decides.
+  const themeParam = new URLSearchParams(location.search).get("theme");
+  if (themeParam === "light" || themeParam === "dark") {
+    document.documentElement.dataset.theme = themeParam;
+  }
+
+  // ---- theme -------------------------------------------------------------
+  const themeBtn = $("themeBtn");
+  themeBtn.textContent = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  themeBtn.onclick = () => {
+    const light = document.documentElement.dataset.theme === "light";
+    document.documentElement.dataset.theme = light ? "dark" : "light";
+    themeBtn.textContent = light ? "light" : "dark";
+    draw();
+  };
+
+  // ---- price chart -------------------------------------------------------
+  const W = 900, H = 320, PAD = { t: 12, r: 58, b: 22, l: 8 }, POSH = 42;
+
+  function draw() {
+    const svg = $("chart");
+    const pts = S.history;
+    if (pts.length < 2) { svg.innerHTML = ""; return; }
+
+    const plotH = H - PAD.t - PAD.b - POSH;
+    const lo = Math.min(...pts.map(p => p.mid)), hi = Math.max(...pts.map(p => p.mid));
+    const pad = (hi - lo) * 0.18 || Math.max(hi * 1e-5, 0.5);
+    const y0 = lo - pad, y1 = hi + pad;
+    const X = i => PAD.l + (i / (pts.length - 1)) * (W - PAD.l - PAD.r);
+    const Y = v => PAD.t + plotH - ((v - y0) / (y1 - y0)) * plotH;
+
+    let out = "";
+    // hairline grid + right-hand price labels
+    for (let g = 0; g <= 4; g++) {
+      const v = y0 + (y1 - y0) * (g / 4), y = Y(v);
+      out += `<line class="gridline" x1="${PAD.l}" y1="${y}" x2="${W - PAD.r}" y2="${y}"/>`;
+      out += `<text class="axis" x="${W - PAD.r + 6}" y="${y + 3}">${fmt(v, 1)}</text>`;
+    }
+    const line = pts.map((p, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(p.mid).toFixed(1)}`).join("");
+    out += `<path class="price-area" d="${line}L${X(pts.length - 1)},${PAD.t + plotH}L${X(0)},${PAD.t + plotH}Z"/>`;
+    out += `<path class="price-line" d="${line}"/>`;
+
+    // position strip, its own band under the price - separate scale, separate chart
+    const maxU = S.config.max_units || 0.05;
+    const pTop = PAD.t + plotH + 14;
+    const PY = u => pTop + POSH / 2 - (u / maxU) * (POSH / 2 - 3);
+    out += `<line class="gridline" x1="${PAD.l}" y1="${PY(0)}" x2="${W - PAD.r}" y2="${PY(0)}"/>`;
+    out += `<text class="axis" x="${W - PAD.r + 6}" y="${PY(0) + 3}">0</text>`;
+    out += `<text class="axis" x="${W - PAD.r + 6}" y="${PY(maxU) + 3}">+${maxU}</text>`;
+    let step = "";
+    pts.forEach((p, i) => {
+      const x = X(i), y = PY(p.position || 0);
+      step += i ? `L${x.toFixed(1)},${(PY(pts[i - 1].position || 0)).toFixed(1)}L${x.toFixed(1)},${y.toFixed(1)}`
+                : `M${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    out += `<path class="poslin" d="${step}"/>`;
+
+    // trade markers: shape carries the side as well as colour
+    const bySeq = new Map(pts.map((p, i) => [p.seq, i]));
+    for (const t of S.trades) {
+      const i = bySeq.get(t.seq);
+      if (i === undefined) continue;
+      const x = X(i), y = Y(pts[i].mid), buy = t.side === "buy";
+      const d = buy ? `M${x},${y - 9}L${x + 6},${y + 2}L${x - 6},${y + 2}Z`
+                    : `M${x},${y + 9}L${x + 6},${y - 2}L${x - 6},${y - 2}Z`;
+      out += `<path class="mark ${buy ? "buy" : "sell"}" d="${d}"/>`;
+    }
+
+    // last price, direct-labelled (the one label that earns its place)
+    const last = pts[pts.length - 1];
+    out += `<circle cx="${X(pts.length - 1)}" cy="${Y(last.mid)}" r="3.5"
+             fill="var(--series-1)" stroke="var(--surface-1)" stroke-width="2"/>`;
+    out += `<g id="cross" style="display:none">
+              <line class="crosshair" id="crossL" x1="0" y1="${PAD.t}" x2="0" y2="${PAD.t + plotH}"/>
+            </g>`;
+    svg.innerHTML = out;
+    svg._scale = { X, Y, pts, plotH };
+  }
+
+  // ---- latency chart -----------------------------------------------------
+  function drawLatency() {
+    const svg = $("latChart"), LW = 900, LH = 130, lp = { t: 10, r: 58, b: 18, l: 8 };
+    const vals = S.latencies;
+    if (!vals.length) { svg.innerHTML = ""; return; }
+    const budget = S.config.interval_ms || 1000;
+    const top = Math.max(budget * 1.15, ...vals) * 1.05;
+    const h = LH - lp.t - lp.b;
+    const n = vals.length;
+    const bw = Math.max(1.5, (LW - lp.l - lp.r) / Math.max(n, 40) - 1.5);
+    const X = i => lp.l + (i / Math.max(n, 40)) * (LW - lp.l - lp.r);
+    const Y = v => lp.t + h - (v / top) * h;
+
+    let out = "";
+    for (let g = 0; g <= 2; g++) {
+      const v = (top / 2) * g, y = Y(v);
+      out += `<line class="gridline" x1="${lp.l}" y1="${y}" x2="${LW - lp.r}" y2="${y}"/>`;
+      out += `<text class="axis" x="${LW - lp.r + 6}" y="${y + 3}">${Math.round(v)}</text>`;
+    }
+    vals.forEach((v, i) => {
+      const y = Y(v), late = v > budget;
+      out += `<rect x="${X(i).toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}"
+               height="${Math.max(1, lp.t + h - y).toFixed(1)}" rx="1.5"
+               fill="${late ? "var(--sell)" : "var(--series-1)"}"/>`;
+    });
+    // the budget rule, solid hairline in an emphasis colour, directly labelled
+    const by = Y(budget);
+    out += `<line x1="${lp.l}" y1="${by}" x2="${LW - lp.r}" y2="${by}"
+             stroke="var(--warn)" stroke-width="1.5"/>`;
+    out += `<text class="axis" x="${lp.l + 4}" y="${by - 5}" fill="var(--warn)">
+             deadline ${budget} ms</text>`;
+    svg.innerHTML = out;
+  }
+
+  // ---- answers panel -----------------------------------------------------
+  const Q = [
+    ["direction", "direction"], ["follow_through", "follow-thru"],
+    ["setup_quality", "setup"], ["liquidity_ok", "liquidity"],
+    ["disorderly", "disorderly"], ["cut_position", "cut position"],
+  ];
+  const CHOICE_COLOR = {
+    up: "var(--buy)", down: "var(--sell)", unclear: "var(--text-muted)",
+    continuation: "var(--buy)", reversal: "var(--sell)", no_clear_pattern: "var(--text-muted)",
+  };
+  const CHOICE_ORDER = ["up", "unclear", "down",
+                        "continuation", "no_clear_pattern", "reversal"];
+  const ordered = probs => Object.entries(probs).sort(
+    (a, b) => CHOICE_ORDER.indexOf(a[0]) - CHOICE_ORDER.indexOf(b[0]));
+
+  function drawAnswers() {
+    const box = $("answers"), d = S.decision;
+    if (!d) { box.innerHTML = `<div class="note">waiting for the first decision…</div>`; return; }
+    let out = "";
+    for (const [key, label] of Q) {
+      const a = d.answers[key];
+      if (!a) continue;
+      let bar = "", val = "";
+      if (a.type === "choice") {
+        for (const [opt, p] of ordered(a.probabilities)) {
+          if (p < 0.005) continue;
+          bar += `<i style="width:${(p * 100).toFixed(1)}%;background:${CHOICE_COLOR[opt] || "var(--series-1)"}"
+                    title="${opt} ${(p * 100).toFixed(0)}%"></i>`;
+        }
+        val = a.choice === "no_clear_pattern" ? "none" : a.choice;
+      } else if (a.type === "score") {
+        const f = a.score / Math.max(a.levels - 1, 1);
+        bar = `<i style="width:${(f * 100).toFixed(1)}%;background:var(--series-1)"></i>`;
+        val = `${a.score.toFixed(1)}/${a.levels - 1}`;
+      } else {
+        const p = a.noul;
+        bar = `<i style="width:${(p * 100).toFixed(1)}%;background:${p > 0.5 ? "var(--series-1)" : "var(--text-muted)"}"></i>`;
+        val = p.toFixed(2);
+      }
+      out += `<div class="qrow"><div class="qname">${label}</div>
+              <div class="qbar">${bar}</div><div class="qval">${val}</div></div>`;
+    }
+    const gate = d.gate ? `gated: <em style="color:var(--warn)">${d.gate}</em>` : "no gate";
+    out += `<div class="note" style="margin-top:10px">
+              edge <b style="color:var(--text-primary)">${d.edge >= 0 ? "+" : ""}${d.edge.toFixed(3)}</b>
+              &nbsp;·&nbsp; ${gate}
+              &nbsp;·&nbsp; target <b style="color:var(--text-primary)">${d.target.toFixed(4)}</b> BTC
+            </div>`;
+    box.innerHTML = out;
+    $("decSub").textContent =
+      `six typed questions, one request · ${d.tokens} tokens · ${d.latency_ms} ms`;
+  }
+
+  function drawState() {
+    const d = S.decision;
+    if (!d || !d.state) return;
+    const lines = [];
+    const walk = (obj, depth) => {
+      for (const [k, v] of Object.entries(obj)) {
+        if (v && typeof v === "object") {
+          lines.push(`${"  ".repeat(depth)}<b>${k}</b>`);
+          walk(v, depth + 1);
+        } else {
+          lines.push(`${"  ".repeat(depth)}<b>${k}:</b> <em>${v}</em>`);
+        }
+      }
+    };
+    walk(d.state, 0);
+    $("stateBox").innerHTML = lines.join("\n");
+  }
+
+  function drawTrades() {
+    const body = $("tradeBody");
+    if (!S.trades.length) {
+      body.innerHTML = `<tr><td colspan="4" style="color:var(--text-muted)">no trades yet</td></tr>`;
+      return;
+    }
+    body.innerHTML = S.trades.slice(0, 12).map(t => {
+      const time = new Date(t.ts * 1000).toLocaleTimeString("en-GB");
+      const arrow = t.side === "buy" ? "▲" : "▼";
+      return `<tr><td>${time}</td>
+              <td class="side-${t.side}">${arrow} ${t.side.toUpperCase()}</td>
+              <td class="num">${t.units.toFixed(4)}</td>
+              <td class="num">${fmt(t.price)}</td></tr>`;
+    }).join("");
+  }
+
+  function drawStats() {
+    const s = S.stats, c = S.config;
+    if (!Object.keys(s).length) return;
+    $("dec").innerHTML = `${s.decisions}${s.dropped ? ` <small>+${s.dropped} late</small>` : ""}`;
+    $("pos").innerHTML = `${s.position.toFixed(4)} <small>BTC</small>`;
+    const pnl = $("pnl");
+    pnl.textContent = (s.net >= 0 ? "+" : "") + fmt(s.net);
+    pnl.style.color = Math.abs(s.net) < 0.005 ? "var(--text-primary)"
+      : (s.net > 0 ? "var(--buy)" : "var(--sell)");
+    $("pct").textContent = `${s.p50 || "—"} / ${s.p95 || "—"}`;
+    $("cost").textContent = `$${(s.cost_usd || 0).toFixed(4)}`;
+    $("feeNote").textContent = c.fee_bps ? `(${c.fee_bps} bp fee)` : "(spread only)";
+    if (s.warming) {
+      $("statusTxt").textContent = `warming up ${Math.round(s.warmup_progress * 100)}%`;
+    }
+    $("runNote").innerHTML = `
+      provider <b>${c.provider}</b> / ${c.model}<br>
+      snapshot every ${c.interval_ms} ms · max position ${c.max_units} BTC<br>
+      ${s.fills} fills · gross ${fmt(s.gross)} · fees ${fmt(s.fees)}<br>
+      ${s.tokens.toLocaleString()} input tokens = $${(s.cost_usd || 0).toFixed(4)}
+      ${c.provider === "mock" ? '<br><span style="color:var(--warn)">offline simulator — not Jev</span>' : ""}`;
+  }
+
+  // ---- hover -------------------------------------------------------------
+  const tip = $("tip");
+  $("chart").addEventListener("mousemove", ev => {
+    const svg = $("chart"), sc = svg._scale;
+    if (!sc) return;
+    const r = svg.getBoundingClientRect();
+    const i = Math.round(((ev.clientX - r.left) / r.width * 900 - PAD.l) /
+                         (900 - PAD.l - PAD.r) * (sc.pts.length - 1));
+    const p = sc.pts[Math.max(0, Math.min(sc.pts.length - 1, i))];
+    if (!p) return;
+    const cross = document.getElementById("cross");
+    if (cross) {
+      cross.style.display = "";
+      const x = sc.X(Math.max(0, Math.min(sc.pts.length - 1, i)));
+      cross.firstElementChild.setAttribute("x1", x);
+      cross.firstElementChild.setAttribute("x2", x);
+    }
+    tip.style.opacity = 1;
+    tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 190) + "px";
+    tip.style.top = (ev.clientY - 10) + "px";
+    tip.innerHTML = `<b>${fmt(p.mid)}</b><br>
+      <span>bid</span> ${fmt(p.bid)} &nbsp; <span>ask</span> ${fmt(p.ask)}<br>
+      <span>spread</span> ${p.spread_bps.toFixed(3)} bp<br>
+      <span>position</span> ${(p.position || 0).toFixed(4)}<br>
+      <span>equity</span> ${fmt(p.equity)}<br>
+      <span>${new Date(p.ts * 1000).toLocaleTimeString("en-GB")}</span>`;
+  });
+  $("chart").addEventListener("mouseleave", () => {
+    tip.style.opacity = 0;
+    const cross = document.getElementById("cross");
+    if (cross) cross.style.display = "none";
+  });
+
+  // ---- stream ------------------------------------------------------------
+  function showLatency(d) {
+    $("lat").textContent = Math.round(d.latency_ms);
+    const bar = $("budgetBar");
+    bar.style.width = Math.min(100, d.budget_pct) + "%";
+    bar.className = d.late ? "late" : "";
+  }
+
+  function setStatus(kind, text) {
+    $("statusDot").className = "dot " + kind;
+    $("statusTxt").textContent = text;
+  }
+
+  function onTick(e) {
+    S.history.push(e);
+    if (S.history.length > 240) S.history.shift();
+    $("px").textContent = fmt(e.mid);
+    const first = S.history[0].mid;
+    const chg = (e.mid / first - 1) * 100;
+    const el = $("chg");
+    el.textContent = `${chg >= 0 ? "+" : ""}${chg.toFixed(3)}% this window`;
+    el.style.color = Math.abs(chg) < 0.0005 ? "var(--text-muted)"
+      : (chg > 0 ? "var(--buy)" : "var(--sell)");
+    draw();
+  }
+
+  // ?static=1 renders a single snapshot instead of holding the stream open.
+  // Useful for screenshots, and necessary for a headless browser, which can
+  // never finish loading a page that keeps a fetch pending forever.
+  const STATIC = new URLSearchParams(location.search).has("static");
+
+  function handle(e) {
+    switch (e.type) {
+      case "hello":
+        S.config = e.config; S.history = e.history || []; S.trades = e.trades || [];
+        S.latencies = e.latencies || []; S.decision = e.decision; S.stats = e.stats || {};
+        $("sym").textContent = e.config.symbol;
+        $("chartTitle").textContent = `${e.config.symbol} mid price, live`;
+        setStatus("on", e.config.provider === "mock" ? "simulator" : "live jev");
+        if (S.history.length) $("px").textContent = fmt(S.history[S.history.length - 1].mid);
+        if (S.decision) showLatency(S.decision);
+        draw(); drawLatency(); drawAnswers(); drawState(); drawTrades(); drawStats();
+        break;
+      case "tick": onTick(e); break;
+      case "thinking":
+        setStatus("think", "asking jev…");
+        break;
+      case "decision": {
+        S.decision = e;
+        S.latencies.push(e.latency_ms);
+        if (S.latencies.length > 200) S.latencies.shift();
+        showLatency(e);
+        setStatus("on", e.late ? "late — dropped" : "live jev");
+        drawLatency(); drawAnswers(); drawState();
+        break;
+      }
+      case "fill":
+        S.trades.unshift(e);
+        if (S.trades.length > 40) S.trades.pop();
+        drawTrades(); draw();
+        break;
+      case "stats": S.stats = e; drawStats(); break;
+      case "error": $("errBox").textContent = e.message; break;
+    }
+  }
+
+  if (STATIC) {
+    fetch("/snapshot").then(r => r.json()).then(handle);
+  } else {
+    const es = new EventSource("/stream");
+    es.onopen = () => setStatus("on", "connected");
+    es.onerror = () => setStatus("", "reconnecting…");
+    es.onmessage = ev => handle(JSON.parse(ev.data));
+  }
+})();
+</script>
+</body>
+</html>

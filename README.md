@@ -289,6 +289,52 @@ Two safeguards run in code on every tick, independent of the model — a stop
 loss and a drawdown kill switch. Nothing that requires a network call should be
 the only thing between a position and a loss.
 
+## The live demo
+
+```bash
+export TYPESAFE_API_KEY=sk-...
+python -m jevtrade.server            # http://127.0.0.1:8787
+```
+
+A page that watches Jev trade a live BTC curve, one decision per second.
+
+![the live demo](docs/demo.png)
+
+The point of the page is the **latency budget**. Every snapshot is a 1000 ms
+window, and the hero tile shows how much of it the decision consumed —
+typically a third. The bar chart puts one bar per call under a rule line at the
+deadline: a decision slower than one snapshot describes a book that no longer
+exists, so it is dropped rather than traded. Measured over a live session:
+
+```
+p50 386 ms   ·   p95 490 ms   ·   0 dropped out of 366 decisions
+1093 input tokens per decision = $0.000046
+```
+
+The right-hand column is the part worth watching: `What Jev was shown` is the
+state in words, and `What Jev answered` is the six typed answers with their
+probability distributions, updating live. You can watch a Choice swing from
+`up` to `down` and see the gate that follows from it.
+
+This path uses **Kraken's ticker, which carries the real best bid and ask with
+their resting sizes** — unlike the 1-minute OHLCV replay above, where the book
+has to be reconstructed. The feature window is primed from the public trade
+tape, so the demo starts trading immediately instead of waiting a minute.
+
+Notes on what the P&L means: trades cross the real spread, but no exchange fee
+is modelled by default (`--fee-bps` adds one), and it is paper trading against
+observed prices, not order placement. It is a demo of a decision loop, not a
+trading result.
+
+```
+--symbol BTC|ETH|SOL   --port 8787        --interval-ms 1000
+--max-units 0.05       --fee-bps 0        --provider auto|jev|mock
+```
+
+The API key stays in the server process; the browser never sees it. Without a
+key the page runs the offline simulator and says so. `?static=1` renders one
+snapshot instead of holding the stream open, and `?theme=light` forces a mode.
+
 ## Real market data
 
 ```bash
@@ -307,7 +353,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 76 tests
+python -m pytest -q      # 89 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -330,6 +376,9 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `execution.py` | fills, spread, impact, fees |
 | `metrics.py` | P&L, hit rate, calibration, break-even fee |
 | `baselines.py` | rule strategies for comparison |
+| `live.py` | Kraken live top-of-book, real bid/ask and sizes |
+| `server.py` | the demo server: trading loop + SSE |
+| `web/index.html` | the demo page |
 
 TypeSafe also ships first-party SDKs (`pip install typesafe-sdk`,
 `@typesafe-ai/sdk`). This repo speaks HTTP directly so the wire format stays
