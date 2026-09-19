@@ -569,22 +569,38 @@ def calendar_rows(store: Store) -> list[dict[str, Any]]:
     return sorted(seen.values(), key=lambda r: r["ts"])
 
 
+_RATE_ROW = re.compile(r"\brate\b", re.I)
+_NOT_RATE_ROW = re.compile(r"votes?|statement|projections|press conference|minutes|summary|speaks", re.I)
+
+
 def match_calendar(
     document: Document, rows: list[dict[str, Any]], *, tolerance_s: float = 900.0
 ) -> dict[str, Any] | None:
-    """The calendar row this document *is*, if the snapshot covers its week."""
-    best: dict[str, Any] | None = None
-    for row in rows:
-        if row["country"] != document.currency:
-            continue
-        gap = abs(row["ts"] - document.ts)
-        if gap > tolerance_s:
-            continue
-        if best is None or gap < abs(best["ts"] - document.ts):
-            best = row
-        if row.get("forecast") and (best is None or not best.get("forecast")):
-            best = row
-    return best
+    """The calendar row this document *is*, if the snapshot covers its week.
+
+    A decision publishes several rows at the same minute ("Official Bank Rate",
+    "MPC Official Bank Rate Votes", "Monetary Policy Summary"); the one whose
+    forecast is a rate wins, so "3-0-6" never gets read as three percent.
+    """
+    near = [
+        row for row in rows
+        if row["country"] == document.currency and abs(row["ts"] - document.ts) <= tolerance_s
+    ]
+    if not near:
+        return None
+
+    def rank(row: dict[str, Any]) -> tuple[int, int, int, float]:
+        title = row.get("title") or ""
+        forecast = row.get("forecast") or ""
+        is_rate = bool(_RATE_ROW.search(title)) and not _NOT_RATE_ROW.search(title)
+        return (
+            0 if is_rate and "%" in forecast else 1,
+            0 if "%" in forecast else 1,
+            0 if forecast else 1,
+            abs(row["ts"] - document.ts),
+        )
+
+    return min(near, key=rank)
 
 
 __all__ = [

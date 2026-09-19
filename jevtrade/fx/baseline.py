@@ -54,6 +54,11 @@ class BotSignal:
     note: str = ""
 
 
+def _is_percent(text: Any) -> bool:
+    """A calendar cell that is a rate ("4.00%", "<1.25%"), not a vote ("3-0-6")."""
+    return isinstance(text, str) and "%" in text and not re.search(r"\d+-\d+-\d+", text)
+
+
 def _value(text: str) -> float | None:
     """A percentage written as ``4``, ``4.00`` or ``3-3/4`` -> a float."""
     text = (text or "").strip().rstrip("%").strip()
@@ -90,12 +95,42 @@ def keyword_bot(document: Document) -> list[BotSignal]:
     return [BotSignal(pair, sign, note=f"{stance} {hawks}-{doves}")]
 
 
+_RANGE = r"\d+(?:-\d+/\d+)?(?:\.\d+)?(?:\s+to\s+\d+(?:-\d+/\d+)?(?:\.\d+)?)?"
+# "Bank rate maintained at 3.75%", "raises Bank Rate to 4%"
+_TITLE_RATE = re.compile(r"\b(?:at|to)\s+(" + _RANGE + r")\s*(?:percent|per cent|%)", re.I)
+# "decided to raise the target range for the federal funds rate by 1/4 percentage
+# point to 3-3/4 to 4 percent", "voted ... to maintain Bank Rate at 3.75%"
+_DECISION = re.compile(
+    r"\b(?:maintain|maintained|maintains|keep|kept|keeps|hold|held|holds|raise|raised|raises|"
+    r"increase|increased|increases|lower|lowered|lowers|cut|cuts|reduce|reduced|reduces)\s+"
+    r"(?:the\s+)?(?:target range for the federal funds rate|federal funds rate|bank rate|"
+    r"policy rate|uncollateralized overnight call rate|deposit facility rate|cash rate|"
+    r"official cash rate|policy interest rate|overnight rate target|overnight rate)\s+"
+    r"(?:unchanged\s+)?(?:at|to|by\s+[^.]{0,40}?\bto)\s+(" + _RANGE + r")\s*(?:percent|per cent|%)",
+    re.I,
+)
+
+
 def announced_rate(text: str) -> float | None:
     """The rate the text says was set, in percent, or ``None``.
 
     The top of a target range is used, because that is what the calendar quotes
-    (the September FOMC "3-3/4 to 4 percent" is 4.00% on ForexFactory).
+    (the September FOMC "3-3/4 to 4 percent" is 4.00% on ForexFactory). The title
+    is read first ("Bank rate maintained at 3.75%"), then the decision sentence
+    (a verb, the rate's name, "at" or "to", the number); a page full of other
+    percentages -- the 2% target, CPI, vote shares -- is not allowed to answer.
     """
+    title, _, body = (text or "").partition("\n")
+    match = _TITLE_RATE.search(title)
+    if match:
+        value = _range_top(match.group(1))
+        if value is not None:
+            return value
+    match = _DECISION.search(body) or _DECISION.search(title)
+    if match:
+        value = _range_top(match.group(1))
+        if value is not None:
+            return value
     match = _TARGET.search(text or "")
     if match:
         value = _range_top(match.group(1))
@@ -114,7 +149,7 @@ def surprise_bot(
     if not RATE_TITLE.search(document.title or ""):
         return []
     row = match_calendar(document, list(rows))
-    if row is None or not row.get("forecast"):
+    if row is None or not _is_percent(row.get("forecast")):
         return []
     forecast = _value(row["forecast"])
     actual = announced_rate(f"{document.title}\n{document.body}")

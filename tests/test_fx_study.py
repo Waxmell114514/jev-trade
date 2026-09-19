@@ -789,3 +789,53 @@ def test_cli_fx_says_so_and_fails_when_the_window_is_empty(tmp_path, monkeypatch
                      "--cache", str(tmp_path / "cache")])
     assert code == 1
     assert "no documents in range" in capsys.readouterr().err
+
+
+# --- the surprise bot must read the rate, not the vote or the target -------------
+
+BOE_SEPTEMBER = (
+    "At its meeting ending on 16 September 2026, the Monetary Policy Committee (MPC) "
+    "voted by a majority of 6–3 to maintain Bank Rate at 3.75%. Three members voted to "
+    "increase Bank Rate by 0.25 percentage points, to 4%. UK CPI inflation increased to "
+    "3.1% in August. Monetary policy is being set to ensure inflation comes down to 2% "
+    "sustainably. 36% of firms expect... 78% of respondents..."
+)
+
+
+def test_announced_rate_ignores_the_target_the_dissent_and_the_survey_percentages():
+    title = "Bank rate maintained at 3.75% - September 2026 Monetary Policy Summary and Minutes"
+    assert B.announced_rate(f"{title}\n{BOE_SEPTEMBER}") == 3.75
+    # the title alone carries it; the body alone carries it too, via the decision sentence
+    assert B.announced_rate(title) == 3.75
+    assert B.announced_rate(f"\n{BOE_SEPTEMBER}") == 3.75
+    # a page of percentages with no decision sentence answers nothing
+    assert B.announced_rate("\nInflation is 3.1%. The target is 2%. Growth was 0.5%.") is None
+
+
+def test_calendar_match_prefers_the_rate_row_over_the_votes_row():
+    rows = [
+        {"country": "GBP", "ts": 1000.0, "title": "MPC Official Bank Rate Votes",
+         "forecast": "3-0-6", "previous": "3-0-6"},
+        {"country": "GBP", "ts": 1000.0, "title": "Monetary Policy Summary",
+         "forecast": "", "previous": ""},
+        {"country": "GBP", "ts": 1000.0, "title": "Official Bank Rate",
+         "forecast": "3.75%", "previous": "3.75%"},
+        {"country": "USD", "ts": 1000.0, "title": "Federal Funds Rate",
+         "forecast": "4.00%", "previous": "3.75%"},
+    ]
+    boe = D.Document(id="boe-1", issuer="boe", kind="monetary_policy", ts=1060.0,
+                     title="Bank rate maintained at 3.75% - September 2026", body=BOE_SEPTEMBER,
+                     url="u", currency="GBP")
+    assert D.match_calendar(boe, rows)["title"] == "Official Bank Rate"
+    # in line with the forecast: the surprise bot stays out, instead of shorting on "3-0-6"
+    assert B.surprise_bot(boe, rows) == []
+    beat = [dict(r, forecast="3.50%") if r["title"] == "Official Bank Rate" else r for r in rows]
+    assert [s.sign for s in B.surprise_bot(boe, beat)] == [+1]  # 3.75 printed vs 3.50 expected
+    # a votes-only snapshot never yields a signal
+    votes_only = [r for r in rows if r["title"] != "Official Bank Rate"]
+    assert B.surprise_bot(boe, votes_only) == []
+
+
+def test_is_percent_tells_rates_from_votes():
+    assert B._is_percent("4.00%") and B._is_percent("<1.25%")
+    assert not B._is_percent("3-0-6") and not B._is_percent("") and not B._is_percent(None)

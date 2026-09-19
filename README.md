@@ -810,7 +810,74 @@ therefore checked against the bars' own timestamps and dropped when the window
 is not contiguous. Model answers are cached per document and tree version, so
 the threshold sweep scores one fixed set of answers rather than re-sampling.
 
-The run has not been done yet; the numbers will go here when it has.
+### The run (real model, 60 days)
+
+```bash
+python -m jevtrade.cli fx --provider jev --days 60 --out runs/fx-jev-60d.json
+```
+
+Run on 2026-09-19: 30 documents from 2026-07-29 to 09-18 (Fed 11, BoE 11, ECB
+5, BoJ 3), 14 went to round two, 8 questions in the median document and 32 with
+a full statement diff, **median 693 ms per document, p90 928 ms, $0.004 of input
+tokens** for the lot. Keyword and reader answers are the same cached set across
+every row.
+
+```
+arm              signals traded    pre    bar      +5m     +15m     +30m     +60m  hit15    z15
+keyword-bot           18     17     -1     +1       -0       -1       +2       +1    50%   -0.5
+  s.e.                                             +-1      +-2      +-2      +-3
+surprise-bot           0      0     (both snapshotted decisions printed in line with the forecast)
+reader >=0.15          6      5     -1     +0       -1       -3       +5       +6    40%   -1.0
+  s.e.                                             +-1      +-4      +-6      +-7
+all text              30     29     -1     -0       +0       +0       +2       +3    54%   -0.0
+  s.e.                                             +-0      +-1      +-2      +-3
+```
+
+Nothing clears the noise, and with five reader trades nothing could: −3 ± 4 bp
+at fifteen minutes and +6 ± 7 at sixty is a sample size, not a verdict. What
+the run does settle is that the tree reads the way it was meant to, which with
+thirty documents is the part worth looking at:
+
+- **The 2026-09-16 FOMC hike** came back `rate_decision`, hawkish at p = 1.00,
+  magnitude 0.86, round two confirmed at 0.71, strength 0.47 — the highest of
+  the run. Short EURUSD. The release bar had already moved −13 bp (the fastest
+  actors' five minutes); the trade then made +10, +29 and +31 bp at 15, 30 and
+  60 minutes. The number was on the calendar; the text was still moving price
+  an hour later.
+- **The 2026-07-29 hold with three hawkish dissents** came back hawkish at
+  p = 0.51 with a round-two confirmation of 0.17: strength 0.03, no trade. The
+  keyword bot shorted EURUSD on the dissent language and was down 8 bp at
+  fifteen minutes. The reversed-framing round is what kept the reader out.
+- **The ECB's 2026-09-10 decision** was read hawkish at p = 1.00, magnitude
+  0.84 — confident, long EURUSD, and wrong: −13 bp at fifteen minutes, −12 at
+  sixty. The press-conference statement 45 minutes later, also read long, made
+  +9 at sixty. Confidence is not accuracy; one document says nothing about the
+  rate, and this is the one to remember when the sample is larger.
+- **Noise was filtered.** Court of Directors minutes, an AI-consortium minute,
+  a chair appointment and a 2027 meeting calendar all came back neutral at
+  p ≈ 1.00 with magnitude between 0.01 and 0.05 and were never traded. The
+  keyword bot traded several of them.
+- **The BoJ is blind.** Its RSS links are PDFs, the body extractor is standard
+  library only, so those documents arrived with empty bodies and the reader
+  classified the 2026-09-18 hike from its title alone (hawkish 0.82, strength
+  0.03). The issuer with the largest text-driven moves in the motivating table
+  contributed nothing. A PDF reader is the cheapest improvement on this list.
+- **The surprise arm is empty because the surprises were.** The FOMC printed
+  4.00% against a 4.00% forecast and the BoE 3.75% against 3.75%. A first cut
+  of this arm shorted GBPUSD on the BoE decision: the calendar match had picked
+  the "MPC Official Bank Rate Votes" row, whose forecast is "3-0-6", and the
+  rate parser had read the 2% inflation target as the rate. Both are fixed and
+  tested; the table above is from after the fix.
+
+The binding constraint is the judge, not the feed. Sixty days of five-minute
+bars gave thirty documents. The Fed archive alone holds, with minute
+timestamps, **179 FOMC statements, 1002 monetary-policy releases, 1120 speeches
+and 216 testimonies since 2009**, and Dukascopy's free tick files
+(`datafeed.dukascopy.com/datafeed/EURUSD/YYYY/MM/DD/HHh_ticks.bi5`, month
+zero-based, LZMA over 20-byte records, decodable with the standard library) are
+reachable from this environment. The same study over 2009–2026 is about 2,300
+documents, on the order of $0.30 of input tokens, graded on ticks instead of
+five-minute bars. That run has not been done; it is the next one.
 
 ### What this does not show
 
@@ -858,7 +925,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 234 tests
+python -m pytest -q      # 237 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
