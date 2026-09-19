@@ -50,7 +50,11 @@ import struct
 import sys
 import threading
 import time
+import http.client
+import os
+import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -168,6 +172,74 @@ def decode_bi5(raw: bytes, scale: float, *, at: float = 0.0) -> list[Tick]:
     ]
 
 
+_local = threading.local()
+
+
+def _ssl_context() -> ssl.SSLContext:
+    cafile = (os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+              or os.environ.get("CURL_CA_BUNDLE") or None)
+    return ssl.create_default_context(cafile=cafile)
+
+
+def _connection(host: str, timeout: float) -> http.client.HTTPSConnection:
+    """One persistent TLS connection per thread, tunnelled through the proxy if set.
+
+    Measured from this environment: the first request on a connection to the
+    feed costs 9-16 s (the handshake), every request after it about 0.2 s. A
+    fresh connection per file therefore caps the fetch at ~5 files a minute and
+    trips the feed's 503s under concurrency; one connection per worker, kept
+    open, does ~300 a minute.
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None and getattr(_local, "host", None) == host:
+        conn.timeout = timeout
+        return conn
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if proxy:
+        parsed = urllib.parse.urlparse(proxy)
+        conn = http.client.HTTPSConnection(
+            parsed.hostname or "", parsed.port, timeout=timeout, context=_ssl_context(),
+        )
+        headers = {}
+        if parsed.username:
+            token = base64.b64encode(
+                f"{parsed.username}:{parsed.password or ''}".encode()
+            ).decode("ascii")
+            headers["Proxy-Authorization"] = f"Basic {token}"
+        conn.set_tunnel(host, 443, headers=headers)
+    else:
+        conn = http.client.HTTPSConnection(host, 443, timeout=timeout, context=_ssl_context())
+    _local.conn, _local.host = conn, host
+    return conn
+
+
+def _drop_connection() -> None:
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        finally:
+            _local.conn, _local.host = None, None
+
+
+def _get(url: str, timeout: float = 30.0) -> bytes:
+    """GET over the thread's persistent connection; ``HTTPError`` on a non-200."""
+    parts = urllib.parse.urlparse(url)
+    conn = _connection(parts.hostname or "", timeout)
+    try:
+        conn.request("GET", parts.path or "/", headers={**UA, "Connection": "keep-alive"})
+        response = conn.getresponse()
+        body = response.read()
+    except (http.client.HTTPException, OSError):
+        _drop_connection()
+        raise
+    if response.status != 200:
+        if not response.getheader("Connection", "").lower() == "keep-alive":
+            _drop_connection()
+        raise urllib.error.HTTPError(url, response.status, response.reason, response.headers, None)
+    return body
+
+
 def fetch_bi5(url: str, *, timeout: float = 30.0, tries: int = TRIES) -> bytes:
     """The raw file, ``b""`` for an hour that has none. Raises on transient failures.
 
@@ -182,14 +254,12 @@ def fetch_bi5(url: str, *, timeout: float = 30.0, tries: int = TRIES) -> bytes:
     last = ""
     for attempt in range(max(1, tries)):
         try:
-            request = urllib.request.Request(url, headers=UA)
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
+            return _get(url, timeout=timeout)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return b""
             last = f"HTTP {exc.code}"
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             last = f"{type(exc).__name__}: {exc}"
         if attempt + 1 < tries:
             time.sleep(BACKOFF_S * 2**attempt * (0.5 + random.random()))

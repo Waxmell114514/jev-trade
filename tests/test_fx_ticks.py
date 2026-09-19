@@ -137,7 +137,7 @@ def test_a_transient_failure_is_retried_and_is_not_cached_as_empty(tmp_path, mon
         tries.append(url)
         raise urllib.error.HTTPError(url, 503, "busy", {}, None)
 
-    monkeypatch.setattr(K.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(K, "_get", flaky)
     monkeypatch.setattr(K.time, "sleep", lambda _s: None)
     with pytest.raises(K.TickFeedError):
         K.fetch_bi5("https://x/y.bi5", tries=3)
@@ -156,7 +156,7 @@ def test_a_missing_file_is_a_settled_empty_hour(monkeypatch):
     def missing(url, timeout=30.0):
         raise urllib.error.HTTPError(url, 404, "no", {}, None)
 
-    monkeypatch.setattr(K.urllib.request, "urlopen", missing)
+    monkeypatch.setattr(K, "_get", missing)
     assert K.fetch_bi5("https://x/y.bi5") == b""
 
 
