@@ -30,6 +30,8 @@ import email.utils
 import html
 import json
 import re
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -105,6 +107,12 @@ class Collection:
     documents: list[Document] = field(default_factory=list)
     skipped_no_time: int = 0
     per_issuer: dict[str, int] = field(default_factory=dict)
+    per_kind: dict[str, int] = field(default_factory=dict)
+    # Documents whose page gave back less than ``MIN_BODY`` characters: a PDF, a
+    # spreadsheet, a page the extractor could not find the article in. They are
+    # kept -- the title is still a document -- and counted, so "the reader saw
+    # nothing" never hides inside "the reader was unconvinced".
+    short_bodies: int = 0
 
     def __iter__(self):
         return iter(self.documents)
@@ -216,6 +224,13 @@ def local_string(ts: float, issuer: str) -> str:
 # --------------------------------------------------------------- html to text
 
 _BODY_DIV = re.compile(r'<div\s+class="col-xs-12 col-sm-8 col-md-8"\s*>', re.I)
+# Layouts the Fed has used. The current pages (2009 onwards, all re-templated in
+# the 2015 site rebuild) all carry the first one; the rest are there so a page
+# the rebuild missed degrades to "less text" rather than to "no text".
+_BODY_FALLBACKS = (
+    re.compile(r'<div\s+[^>]*\bclass="[^"]*\bcol-md-8\b[^"]*"[^>]*>', re.I),
+    re.compile(r'<div\s+[^>]*\bid="(?:content|article|leftText)"[^>]*>', re.I),
+)
 _LAST_UPDATE = re.compile(r'<div\s+class="col-xs-12 col-sm-8 col-md-8 last-update"', re.I)
 _DIV_TAG = re.compile(r"<div\b[^>]*>|</div\s*>", re.I)
 _PARAGRAPH = re.compile(r"<p\b[^>]*>(.*?)</p>", re.S | re.I)
@@ -232,6 +247,8 @@ _CHROME = re.compile(
 )
 
 TAIL_MARKERS = ("Implementation Note issued", "For media inquiries")
+# Under this many characters a "body" is a navigation bar, not a document.
+MIN_BODY = 200
 
 
 def strip_tags(segment: str) -> str:
@@ -250,6 +267,14 @@ def _balanced_div(raw: str, start: int) -> str:
     return raw[start:]
 
 
+def _trim_tail(text: str) -> str:
+    for marker in TAIL_MARKERS:
+        cut = text.find(marker)
+        if cut > 0:
+            text = text[:cut]
+    return text.strip()
+
+
 def fed_body_text(raw: str) -> str:
     """The article text of a federalreserve.gov page, without the site chrome.
 
@@ -257,19 +282,27 @@ def fed_body_text(raw: str) -> str:
     tags. The Implementation Note tail is dropped: it is a separate release, on
     a separate page, and repeating it would make every statement look unchanged
     in the part that matters least.
+
+    Older pages were checked rather than assumed: 2009, 2010, 2011, 2012 and 2016
+    statements, speeches and testimony all carry the same wrapper, because the
+    2015 site rebuild re-templated the archive. The fallbacks below are for the
+    pages it missed -- a wider ``col-md-8``, an ``id="content"``, and finally the
+    generic paragraph reader, whichever gives the most text. A page that comes
+    back under ``MIN_BODY`` characters is reported by ``collect`` rather than
+    quietly handed to the model as an empty document.
     """
-    match = _BODY_DIV.search(raw)
-    if match:
-        segment = _balanced_div(raw, match.end())
-    else:
-        end = _LAST_UPDATE.search(raw)
-        segment = raw[: end.start()] if end else raw
-    text = strip_tags(segment)
-    for marker in TAIL_MARKERS:
-        cut = text.find(marker)
-        if cut > 0:
-            text = text[:cut]
-    return text.strip()
+    candidates: list[str] = []
+    for pattern in (_BODY_DIV, *_BODY_FALLBACKS):
+        match = pattern.search(raw)
+        if match:
+            candidates.append(_trim_tail(strip_tags(_balanced_div(raw, match.end()))))
+            if candidates[-1] and len(candidates[-1]) >= MIN_BODY:
+                return candidates[-1]
+    end = _LAST_UPDATE.search(raw)
+    if end:
+        candidates.append(_trim_tail(strip_tags(raw[: end.start()])))
+    candidates.append(_trim_tail(generic_body_text(raw)))
+    return max(candidates, key=len, default="")
 
 
 def generic_body_text(raw: str) -> str:
@@ -447,6 +480,7 @@ def collect(
     fed_fetcher: Callable[[str], str] | None = None,
     rss_fetcher: Callable[[str], str] | None = None,
     body_fetcher: Callable[[str], str] | None = None,
+    progress_every: int = 100,
 ) -> Collection:
     """Every policy-relevant document from ``issuers`` between the bounds.
 
@@ -475,10 +509,19 @@ def collect(
     if limit:
         rows = rows[-limit:]
 
-    def body(url: str) -> str:
-        return store.cached(f"body:{url}", lambda: body_fetcher(url))
-
     urls = list(dict.fromkeys(r["url"] for r in rows))
+    done = 0
+    lock = threading.Lock()
+
+    def body(url: str) -> str:
+        nonlocal done
+        text = store.cached(f"body:{url}", lambda: body_fetcher(url))
+        with lock:
+            done += 1
+            if progress_every and (done % progress_every == 0 or done == len(urls)):
+                print(f"  bodies {done}/{len(urls)}", file=sys.stderr, flush=True)
+        return text
+
     with concurrent.futures.ThreadPoolExecutor(max(1, workers)) as pool:
         bodies = dict(zip(urls, pool.map(body, urls)))
 
@@ -497,6 +540,9 @@ def collect(
         )
         out.documents.append(document)
         out.per_issuer[document.issuer] = out.per_issuer.get(document.issuer, 0) + 1
+        out.per_kind[document.kind] = out.per_kind.get(document.kind, 0) + 1
+        if len(document.body) < MIN_BODY:
+            out.short_bodies += 1
     return out
 
 
@@ -570,7 +616,9 @@ def calendar_rows(store: Store) -> list[dict[str, Any]]:
 
 
 _RATE_ROW = re.compile(r"\brate\b", re.I)
-_NOT_RATE_ROW = re.compile(r"votes?|statement|projections|press conference|minutes|summary|speaks", re.I)
+_NOT_RATE_ROW = re.compile(
+    r"votes?|statement|projections|press conference|minutes|summary|speaks", re.I
+)
 
 
 def match_calendar(
@@ -604,7 +652,8 @@ def match_calendar(
 
 
 __all__ = [
-    "Collection", "Document", "ISSUERS", "ISSUER_CURRENCY", "MONETARY_POLICY",
+    "Collection", "Document", "ISSUERS", "ISSUER_CURRENCY", "MIN_BODY",
+    "MONETARY_POLICY",
     "POLICY_KINDS", "PRESS_RELEASE", "SPEECH", "TESTIMONY", "calendar_rows",
     "calendar_snapshot", "collect", "eu_offset", "fed_archive", "fed_body_text",
     "fetch_body", "generic_body_text", "local_string", "match_calendar",

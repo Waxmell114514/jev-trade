@@ -14,6 +14,7 @@ one at no extra latency, because width is free.
 
 from __future__ import annotations
 
+import bisect
 import difflib
 import re
 from typing import Iterable, Sequence
@@ -78,20 +79,45 @@ def title_family(title: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+class Editions:
+    """Documents grouped by (issuer, kind, title family), each list in time order.
+
+    The linear scan this replaces is fine for a sixty-day window and quadratic
+    over seventeen years: 2,300 documents is 5.3 million title comparisons, done
+    once per document. Built once, the previous edition is a bisection.
+    """
+
+    def __init__(self, documents: Iterable[Document]) -> None:
+        self.by_family: dict[tuple[str, str, str], list[Document]] = {}
+        for document in documents:
+            if not document.body:
+                continue  # an empty body cannot be diffed against
+            key = (document.issuer, document.kind, title_family(document.title))
+            self.by_family.setdefault(key, []).append(document)
+        self._stamps: dict[tuple[str, str, str], list[float]] = {}
+        for key, group in self.by_family.items():
+            group.sort(key=lambda d: d.ts)
+            self._stamps[key] = [d.ts for d in group]
+
+    def previous(self, document: Document) -> Document | None:
+        """The most recent earlier document from the same issuer, kind and family."""
+        key = (document.issuer, document.kind, title_family(document.title))
+        group = self.by_family.get(key)
+        if not group:
+            return None
+        i = bisect.bisect_left(self._stamps[key], document.ts)
+        while i > 0:
+            i -= 1
+            if group[i].id != document.id:
+                return group[i]
+        return None
+
+
 def previous_of(document: Document, documents: Iterable[Document]) -> Document | None:
     """The most recent earlier document from the same issuer, kind and family."""
-    family = title_family(document.title)
-    best: Document | None = None
-    for other in documents:
-        if other.id == document.id or other.ts >= document.ts:
-            continue
-        if other.issuer != document.issuer or other.kind != document.kind:
-            continue
-        if title_family(other.title) != family or not other.body:
-            continue
-        if best is None or other.ts > best.ts:
-            best = other
-    return best
+    if isinstance(documents, Editions):
+        return documents.previous(document)
+    return Editions(documents).previous(document)
 
 
 # ----------------------------------------------------------------- the diff
@@ -122,13 +148,20 @@ def changed_sentences(
 
 
 def diff_for(
-    document: Document, documents: Sequence[Document], *, limit: int = 12
+    document: Document, documents: Sequence[Document] | Editions, *, limit: int = 12
 ) -> tuple[Document | None, list[tuple[str, str]]]:
-    """The previous edition and what changed, or ``(None, [])`` if there is none."""
+    """The previous edition and what changed, or ``(None, [])`` if there is none.
+
+    ``documents`` may be an ``Editions`` index built once for the whole corpus,
+    which is what a run over seventeen years passes.
+    """
     previous = previous_of(document, documents)
     if previous is None or not document.body:
         return None, []
     return previous, changed_sentences(previous.body, document.body, limit=limit)
 
 
-__all__ = ["changed_sentences", "diff_for", "previous_of", "split_sentences", "title_family"]
+__all__ = [
+    "Editions", "changed_sentences", "diff_for", "previous_of", "split_sentences",
+    "title_family",
+]

@@ -621,17 +621,34 @@ def cmd_fx(args: argparse.Namespace) -> int:
     from .fx.reader import TREE_VERSION, Reader
     from .listing.store import Store
 
+    def day_epoch(text: str) -> float:
+        return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+
     store = Store(args.cache)
     issuers = tuple(i.strip().lower() for i in args.issuers.split(",") if i.strip())
     kinds = tuple(k.strip() for k in args.kinds.split(",") if k.strip()) if args.kinds else None
     horizons = tuple(int(h) for h in args.horizons.split(","))
-    since = time.time() - args.days * 86400
+    ticks = args.tape == "dukascopy"
+    now = time.time()
+    # --since/--until are whole UTC days and win over --days; --until includes
+    # the day it names, so "--until 2026-09-18" keeps that evening's speeches.
+    since = day_epoch(args.since) if args.since else now - args.days * 86400
+    until = day_epoch(args.until) + 86400 if args.until else now
+    if until <= since:
+        print("--until is not after --since", file=sys.stderr)
+        return 1
+    if not ticks:
+        short = [h for h in horizons if h < args.bar]
+        if short:
+            print(f"warning: horizon(s) {short} are shorter than one {args.bar}-minute bar "
+                  f"and will round up to one; --tape dukascopy measures them properly",
+                  file=sys.stderr)
 
     if args.snapshot_calendar:
         key, rows = D.calendar_snapshot(store)
         print(f"stored {len(rows)} calendar rows under {key}")
 
-    found = D.collect(store, since=since, issuers=issuers, kinds=kinds,
+    found = D.collect(store, since=since, until=until, issuers=issuers, kinds=kinds,
                       limit=args.limit, workers=args.workers_io)
     documents = found.documents
     if not documents:
@@ -642,7 +659,10 @@ def cmd_fx(args: argparse.Namespace) -> int:
         f"{len(documents)} documents, {first:%Y-%m-%d} to {last:%Y-%m-%d}, "
         f"issuers: {', '.join(f'{k} {v}' for k, v in sorted(found.per_issuer.items()))}"
         f"; {found.skipped_no_time} rows dropped for having no time of day"
+        f"; {found.short_bodies} bodies under {D.MIN_BODY} chars"
     )
+    print("  kinds: " + ", ".join(
+        f"{k} {v}" for k, v in sorted(found.per_kind.items(), key=lambda kv: -kv[1])))
     calendar = D.calendar_rows(store)
     weeks = sorted({D.week_key(r['ts'])[-8:] for r in calendar})
     print(
@@ -661,9 +681,15 @@ def cmd_fx(args: argparse.Namespace) -> int:
 
     provider = make_reader().client.provider
     started = time.perf_counter()
+
+    def progress(done: int, total: int, round_two: int, cost: float) -> None:
+        print(f"  read {done}/{total}, {round_two} to round two, ${cost:.3f}, "
+              f"{time.perf_counter() - started:.0f}s", file=sys.stderr, flush=True)
+
     readings = S.read_all(
         documents, make_reader, store=None if args.no_reading_cache else store,
         cache_tag=f"{provider}:{TREE_VERSION}", calendar=calendar, workers=args.workers,
+        progress=progress,
     )
     walls = sorted(r.wall_ms for r in readings)
     widths = sorted(r.questions_asked for r in readings)
@@ -677,10 +703,15 @@ def cmd_fx(args: argparse.Namespace) -> int:
         f"{(time.perf_counter() - started):.0f}s wall for this run"
     )
 
-    # Yahoo serves 60 days of 5-minute bars and 7 of 1-minute ones; asking for
-    # more silently returns less, so the ceiling is applied here where it shows.
-    depth = min(int(max(args.days, 7)), 60 if args.bar >= 5 else 7)
-    tape = S.Tape(store, bar_min=args.bar, days=depth)
+    if ticks:
+        tape = S.TickTapes(store, workers=args.workers_io)
+    else:
+        # Yahoo serves 60 days of 5-minute bars and 7 of 1-minute ones; asking
+        # for more silently returns less, so the ceiling is applied here.
+        span = max(1.0, (until - since) / 86400.0)
+        tape = S.Tape(store, bar_min=args.bar, days=min(int(max(span, 7)),
+                                                        60 if args.bar >= 5 else 7))
+    graded = dict(horizons=horizons, workers=args.workers_io, latency_s=args.latency)
     arms: list[tuple[str, list[S.Signal], str]] = [
         ("keyword-bot", S.bot_signals(documents, S.keyword_bot), ""),
         ("surprise-bot", S.surprise_signals(documents, calendar),
@@ -689,38 +720,78 @@ def cmd_fx(args: argparse.Namespace) -> int:
         ("all text", S.all_text_signals(documents), ""),
     ]
     summaries: list[S.ArmSummary] = []
+    per_arm: list[list[S.Outcome]] = []
     outcome_pool: list[S.Outcome] = []
     for name, signals, note in arms:
-        outcomes = S.measure(tape, signals, horizons=horizons, workers=args.workers_io)
+        outcomes = S.measure(tape, signals, **graded)
         nulls = S.measure(tape, S.null_signals(tape, outcomes, per=args.null_per,
-                                               horizons=horizons),
-                          horizons=horizons, workers=args.workers_io)
-        summaries.append(S.summarize(name, signals, outcomes, nulls,
-                                     horizons=horizons, note=note))
+                                               horizons=horizons, latency_s=args.latency,
+                                               workers=args.workers_io),
+                          **graded)
+        summaries.append(S.summarize(name, signals, outcomes, nulls, horizons=horizons,
+                                     note=note, latency_s=args.latency if ticks else 0.0))
+        per_arm.append(outcomes)
         outcome_pool.extend(outcomes)
 
     hz = "".join(f"{'+' + str(h) + 'm':>9}" for h in horizons)
-    print(
-        f"\nSigned log return per signal, bps, entering at the open of the first {args.bar}-minute"
-        "\nbar AFTER the release. 'pre' is the 15 min before it; 'bar' is the release bar"
-        "\nitself. z is against the same pair and side at random moments within 5 days,"
-        "\ndrawn only where the tape has bars (spot FX is shut all weekend)."
-    )
-    print(f"\n{'arm':<16}{'signals':>8}{'traded':>7}{'pre':>7}{'bar':>7}{hz}{'hit15':>7}{'z15':>7}")
-    print("-" * (16 + 8 + 7 + 7 + 7 + 9 * len(horizons) + 14))
+    lead = f"{'pre':>7}{'rush':>7}{'sprd':>6}" if ticks else f"{'pre':>7}{'bar':>7}"
+    if ticks:
+        print(
+            f"\nSigned log return per signal, bps, entering on the first tick at or after the"
+            f"\nrelease + {args.latency:g}s, paying the ask to go long and the bid to go short,"
+            "\nexiting at the mid. 'pre' is the 15 min before the release; 'rush' is how far"
+            "\nthe mid moved between the release and the entry, signed by the side taken;"
+            "\n'sprd' is the spread at entry in bps. z is against the same pair and side at"
+            "\nrandom moments within 5 days where the tape has ticks, at the same latency."
+        )
+    else:
+        print(
+            f"\nSigned log return per signal, bps, entering at the open of the first {args.bar}-minute"
+            "\nbar AFTER the release. 'pre' is the 15 min before it; 'bar' is the release bar"
+            "\nitself. z is against the same pair and side at random moments within 5 days,"
+            "\ndrawn only where the tape has bars (spot FX is shut all weekend)."
+        )
+    print(f"\n{'arm':<16}{'signals':>8}{'traded':>7}{lead}{hz}{'hit15':>7}{'z15':>7}")
+    print("-" * (16 + 8 + 7 + len(lead) + 9 * len(horizons) + 14))
     for s in summaries:
         cells = "".join(f"{s.fwd[h].mean:>+9.0f}" for h in horizons)
+        values = (f"{s.pre.mean:>+7.0f}{s.rush.mean:>+7.0f}{s.spread.mean:>6.1f}" if ticks
+                  else f"{s.pre.mean:>+7.0f}{s.release_bar.mean:>+7.0f}")
+        blank = " " * len(lead)
         print(
-            f"{s.name:<16}{s.signals:>8}{s.measured:>7}{s.pre.mean:>+7.0f}"
-            f"{s.release_bar.mean:>+7.0f}{cells}{s.hit.get(15, 0.0):>7.0%}"
-            f"{s.z.get(15, 0.0):>+7.1f}"
+            f"{s.name:<16}{s.signals:>8}{s.measured:>7}{values}{cells}"
+            f"{s.hit.get(15, 0.0):>7.0%}{s.z.get(15, 0.0):>+7.1f}"
         )
         errs = "".join(f"{'+-' + format(s.fwd[h].se, '.0f'):>9}" for h in horizons)
         null = "".join(f"{s.null[h].mean:>+9.0f}" for h in horizons)
-        print(f"{'  s.e.':<16}{'':>8}{'':>7}{'':>7}{'':>7}{errs}")
-        print(f"{'  null':<16}{'':>8}{'':>7}{'':>7}{'':>7}{null}")
+        print(f"{'  s.e.':<16}{'':>8}{'':>7}{blank}{errs}")
+        print(f"{'  null':<16}{'':>8}{'':>7}{blank}{null}")
+        if ticks:
+            mid = "".join(f"{s.fwd_mid[h].mean:>+9.0f}" for h in horizons)
+            print(f"{'  no spread':<16}{'':>8}{'':>7}{blank}{mid}")
         if s.note:
             print(f"{'  (' + s.note + ')':<16}")
+
+    sweep: list[S.ArmSummary] = []
+    if args.latency_sweep and not ticks:
+        print("\n--latency-sweep needs --tape dukascopy; 5-minute bars have one latency",
+              file=sys.stderr)
+    elif args.latency_sweep:
+        reader_arm = arms[2]
+        swept, swept_name = (reader_arm[1], reader_arm[0]) if len(reader_arm[1]) >= 5 \
+            else (arms[3][1], arms[3][0])
+        sweep_h = tuple(h for h in (15, 60) if h in horizons) or (horizons[-1],)
+        sweep = S.latency_sweep(tape, swept, horizons=sweep_h, per=args.null_per,
+                                workers=args.workers_io)
+        print(f"\nlatency sweep ({swept_name}, {len(swept)} signals, net of the half spread):")
+        cols = "".join(f"{'+' + str(h) + 'm':>8}{'s.e.':>7}{'null':>8}{'z':>6}" for h in sweep_h)
+        print(f"{'entry':>8}{'traded':>8}{'rush':>7}{'sprd':>6}{cols}")
+        for row in sweep:
+            cells = "".join(
+                f"{row.fwd[h].mean:>+8.0f}{row.fwd[h].se:>7.0f}"
+                f"{row.null[h].mean:>+8.0f}{row.z[h]:>+6.1f}" for h in sweep_h)
+            print(f"{row.name:>8}{row.measured:>8}{row.rush.mean:>+7.0f}"
+                  f"{row.spread.mean:>6.1f}{cells}")
 
     sweep_h = horizons[min(1, len(horizons) - 1)]
     print(f"\nreader threshold sweep (+{sweep_h}m, same cached answers):")
@@ -728,10 +799,12 @@ def cmd_fx(args: argparse.Namespace) -> int:
           f"{'s.e.':>7}{'null':>8}{'z':>7}")
     for thr in (0.05, 0.10, 0.15, 0.20, 0.25, 0.40):
         signals = S.reader_signals(readings, thr)
-        outcomes = S.measure(tape, signals, horizons=(sweep_h,), workers=args.workers_io)
+        one = dict(horizons=(sweep_h,), workers=args.workers_io, latency_s=args.latency)
+        outcomes = S.measure(tape, signals, **one)
         nulls = S.measure(tape, S.null_signals(tape, outcomes, per=args.null_per,
-                                               horizons=(sweep_h,)),
-                          horizons=(sweep_h,), workers=args.workers_io)
+                                               horizons=(sweep_h,), latency_s=args.latency,
+                                               workers=args.workers_io),
+                          **one)
         s = S.summarize(f"{thr}", signals, outcomes, nulls, horizons=(sweep_h,))
         print(
             f"{thr:>6.2f}{s.signals:>9}{s.measured:>8}{s.fwd[sweep_h].mean:>+8.0f}"
@@ -761,27 +834,53 @@ def cmd_fx(args: argparse.Namespace) -> int:
         fmt = lambda rows: ", ".join(  # noqa: E731
             f"{'long' if s > 0 else 'short'} {p}" for p, s in rows) or "nothing"
         moves = ", ".join(f"{p} {v:+.0f}" for p, v in d.outcomes.items()) or "no tape"
-        print(f"  {when:%m-%d %H:%M} [{d.issuer}] {d.title[:62]}")
+        print(f"  {when:%Y-%m-%d %H:%M} [{d.issuer}] {d.title[:62]}")
         print(f"      bot: {fmt(d.bot)[:70]}")
         print(f"   reader: {fmt(d.reader)[:70]}")
         print(f"     tape: {moves[:70]}")
 
     if args.out:
+        def outcome_row(o: S.Outcome) -> dict[str, Any]:
+            return {
+                "ts": o.signal.ts, "title": o.signal.title, "pair": o.signal.pair,
+                "side": o.signal.sign, "strength": o.signal.strength,
+                "pre_bps": o.pre_bps, "rush_bps": o.rush_bps,
+                "spread_bps": o.spread_bps, "latency_s": o.latency_s,
+                "entry_ts": o.entry_ts,
+                "fwd_bps": {h: o.fwd_bps.get(h) for h in horizons},
+                "fwd_mid_bps": {h: o.fwd_mid_bps.get(h) for h in horizons},
+            }
+
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({
             "provider": provider, "tree": TREE_VERSION, "days": args.days,
+            "since": since, "until": until,
+            "tape": args.tape, "latency_s": args.latency if ticks else None,
             "issuers": issuers, "kinds": kinds, "threshold": args.threshold,
-            "horizons": horizons, "bar_min": args.bar,
+            "horizons": horizons, "bar_min": None if ticks else args.bar,
             "documents": len(documents), "skipped_no_time": found.skipped_no_time,
+            "short_bodies": found.short_bodies, "per_kind": found.per_kind,
             "calendar_weeks": weeks,
             "arms": [
                 {"name": s.name, "signals": s.signals, "measured": s.measured,
                  "note": s.note, "pre": asdict(s.pre), "release_bar": asdict(s.release_bar),
+                 "spread": asdict(s.spread), "rush": asdict(s.rush),
                  "fwd": {h: asdict(v) for h, v in s.fwd.items()},
+                 "fwd_mid": {h: asdict(v) for h, v in s.fwd_mid.items()},
                  "null": {h: asdict(v) for h, v in s.null.items()},
-                 "hit": s.hit, "z": s.z}
-                for s in summaries
+                 "hit": s.hit, "z": s.z,
+                 # Every graded signal, so nobody has to recompute the run to ask
+                 # it a question it was not asked here.
+                 "outcomes": [outcome_row(o) for o in outcomes]}
+                for s, outcomes in zip(summaries, per_arm)
+            ],
+            "latency_sweep": [
+                {"latency_s": r.latency_s, "signals": r.signals, "measured": r.measured,
+                 "spread": asdict(r.spread), "rush": asdict(r.rush),
+                 "fwd": {h: asdict(v) for h, v in r.fwd.items()},
+                 "null": {h: asdict(v) for h, v in r.null.items()}, "z": r.z}
+                for r in sweep
             ],
             "readings": [
                 {"id": r.document.id, "ts": r.document.ts, "issuer": r.document.issuer,
@@ -907,13 +1006,22 @@ def build_parser() -> argparse.ArgumentParser:
     fx = sub.add_parser("fx", help="read central-bank text in one second; the spot tape grades it")
     fx.add_argument("--provider", default="auto", choices=("auto", "jev", "mock"))
     fx.add_argument("--days", type=float, default=60.0, help="how far back; 60 = Yahoo 5m depth")
+    fx.add_argument("--since", default="", help="YYYY-MM-DD; overrides --days")
+    fx.add_argument("--until", default="", help="YYYY-MM-DD, inclusive; overrides --days")
+    fx.add_argument("--tape", default="yahoo", choices=("yahoo", "dukascopy"),
+                    help="yahoo = 5m bars, 60 days deep; dukascopy = ticks, back to 2003")
+    fx.add_argument("--latency", type=float, default=1.0,
+                    help="seconds between the timestamp and the entry tick (dukascopy only)")
+    fx.add_argument("--latency-sweep", action="store_true",
+                    help="same signals entered at 0, 1, 5, 30 and 120 seconds")
     fx.add_argument("--issuers", default="fed,ecb,boj,boe",
                     help="fed has a deep archive; the others are RSS-shallow")
     fx.add_argument("--kinds", default="monetary_policy,speech,testimony",
                     help="document kinds to keep; empty string keeps everything")
     fx.add_argument("--threshold", type=float, default=0.15, help="reader strength to trade")
-    fx.add_argument("--horizons", default="5,15,30,60", help="minutes after entry")
-    fx.add_argument("--bar", type=int, default=5, help="bar size in minutes (5 or 1)")
+    fx.add_argument("--horizons", default="5,15,30,60",
+                    help="minutes after entry; 1 is only meaningful on ticks")
+    fx.add_argument("--bar", type=int, default=5, help="bar size in minutes (5 or 1); yahoo only")
     fx.add_argument("--limit", type=int, default=0, help="only the most recent N documents")
     fx.add_argument("--cache", default=".cache/fx")
     fx.add_argument("--no-reading-cache", action="store_true", help="ask the model again even if cached")

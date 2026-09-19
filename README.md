@@ -723,6 +723,7 @@ sentences.)
 | BoE `rss/news` | yes | last 50 items | `+0100` |
 | ForexFactory `ff_calendar_thisweek.json` | yes | **this week only** | ISO with offset |
 | Yahoo `v8/finance/chart/{sym}` | yes | 60d of 5m, 7d of 1m | epoch seconds, UTC |
+| Dukascopy `datafeed/{SYM}/…/{HH}h_ticks.bi5` | yes | ticks back to 2003 | ms into the UTC hour |
 | Reuters, Bloomberg, X API | no | — | — |
 
 Only the Fed has an archive. Everything else is a window onto the last week or
@@ -810,6 +811,101 @@ therefore checked against the bars' own timestamps and dropped when the window
 is not contiguous. Model answers are cached per document and tree version, so
 the threshold sweep scores one fixed set of answers rather than re-sampling.
 
+### Grading on ticks
+
+Five-minute bars were the binding constraint, not the feed. Yahoo serves sixty
+days of them, which is thirty documents and five reader trades; and a bar has no
+bid and no ask, so every arm was being graded at a mid price nobody is quoted.
+Dukascopy publishes free tick files back to 2003 for the majors and fixes both.
+
+**The format** (probed from this environment, not assumed):
+
+```
+https://datafeed.dukascopy.com/datafeed/{SYMBOL}/{YYYY}/{MM}/{DD}/{HH}h_ticks.bi5
+```
+
+`MM` is **zero-based** — January is `00` — while `DD` and `HH` are ordinary
+two-digit fields and `HH` is the UTC hour. The body is LZMA (`lzma.decompress`,
+standard library). Decompressed it is consecutive 20-byte big-endian records,
+`struct.unpack(">IIIff")` = *(milliseconds since the start of the hour, ask, bid,
+ask volume, bid volume)*. Prices are integers scaled by **1e5**, or by **1e3**
+when the quote currency is JPY: `115510 → 1.15510` on EURUSD, `156225 → 156.225`
+on USDJPY. An hour with no ticks — every weekend hour of seventeen years, most
+holidays — answers `200` with a zero-byte body, and a date the feed does not
+have answers `404`; both are cached as "no ticks", because a run that re-asks for
+every Saturday since 2009 spends its afternoon on them. A `5xx` or a dropped
+connection is the opposite: transient, retried with backoff, and never cached,
+since caching one would turn a bad minute of network into a permanent hole.
+
+**The entry rule, stated so the cost is visible.** A signal enters on the first
+tick at or after `published + latency`, pays the **ask** to go long and hits the
+**bid** to go short, and exits at the **mid** at the horizon. So the round trip
+pays half the spread, which is the friendly end of the honest range — a trade
+that had to hit the other side on the way out would pay `spread` more. Two new
+columns come with it:
+
+- **`rush`** — how far the mid moved between the publication timestamp and the
+  entry tick, signed by the side taken. Positive means the move had already gone
+  the reader's way before it could act: that part of the edge belongs to whoever
+  was faster.
+- **`sprd`** — the bid/ask spread at entry, in bps. EURUSD is under a bp in
+  London hours and several times that in the minute after a statement, which is
+  exactly the minute every arm here trades in.
+
+A `no spread` row under each arm gives the same trade measured mid-to-mid — the
+bar study's number — so the difference between the two lines is what the book
+costs.
+
+**The latency sweep is the whole question in one table.** `--latency-sweep` runs
+the *same* signals at 0, 1, 5, 30 and 120 seconds and prints one row each. Zero
+is the counterfactual nobody has: filled on the first tick after the timestamp
+itself. One second is a model that answered and hit the button. One hundred and
+twenty is a person who read the statement. If the rows are flat, speed was not
+what was being paid for and the reader is buying comprehension, not latency. If
+they decay, the slope *is* the price of being slow, in basis points, and it is
+the number a scalper actually wants. The table sweeps the reader's own signals,
+falling back to `all text` when the threshold leaves the reader with fewer than
+five; whichever it used is named in the caption.
+
+**The sample this buys** (counted, 2009-01-01 to 2026-09-19, not estimated).
+The three Fed archives hold **5,237 rows with a minute timestamp** in that
+window; exactly one row in it carries a date and no time of day, and is dropped
+rather than guessed at. Filtered to the three kinds that can move a currency
+they are **858 monetary-policy releases, 1,116 speeches and 213 testimonies —
+2,187 documents**, 150 of them titled "FOMC statement", running 85 to 191 a
+year. The rest is noise the `pt` field separates out without a judgment call:
+1,185 enforcement actions, 968 banking and consumer regulatory policy items,
+548 other announcements, 349 orders on banking applications. So the tick judge
+turns thirty documents into two thousand, and coverage on the tick side is
+complete: EURUSD, GBPUSD and USDJPY all go back to 2003.
+
+**The body extractor was re-checked on the old pages rather than assumed.** The
+2015 site rebuild re-templated the whole archive, so a 2009 statement, a 2010
+speech and a 2011 testimony all carry the same `col-xs-12 col-sm-8 col-md-8`
+wrapper as a 2026 one. Over all 5,237 documents, **one** comes back under 200
+characters — the 187-character September 2026 Implementation Note, which really
+is that short. `collect` reports that count, because "the reader was
+unconvinced" and "the reader saw nothing" are different results.
+
+```bash
+python -m jevtrade.cli fx --tape dukascopy --since 2009-01-01 --issuers fed \
+    --horizons 1,5,15,30,60 --latency 1.0 --latency-sweep
+```
+
+Everything is cached so the run is resumable: readings per document (keyed on a
+hash of the round-one state, not just the id — a statement whose previous
+edition becomes visible in a longer window is a different question and is read
+again), bodies per URL, tick hours per file as the compressed bytes they arrived
+as. An interrupted run re-reads what it has and fetches only what is missing.
+
+Fetching is the slow part and the model is not what makes it slow. One hour of
+ticks is one HTTPS request, a measured event needs about three of them, and the
+feed answers 503 to parallel connections from some networks — measured here: of
+eight concurrent requests six came back 503 or timed out, while the same eight
+run one at a time all succeeded, at ten to twenty-five seconds each. That is
+what the jittered retry is for, and it is why a seventeen-year run is meant to
+be started, watched in a log, and resumed rather than waited on.
+
 ### The run (real model, 60 days)
 
 ```bash
@@ -870,14 +966,19 @@ thirty documents is the part worth looking at:
   tested; the table above is from after the fix.
 
 The binding constraint is the judge, not the feed. Sixty days of five-minute
-bars gave thirty documents. The Fed archive alone holds, with minute
-timestamps, **179 FOMC statements, 1002 monetary-policy releases, 1120 speeches
-and 216 testimonies since 2009**, and Dukascopy's free tick files
-(`datafeed.dukascopy.com/datafeed/EURUSD/YYYY/MM/DD/HHh_ticks.bi5`, month
-zero-based, LZMA over 20-byte records, decodable with the standard library) are
-reachable from this environment. The same study over 2009–2026 is about 2,300
-documents, on the order of $0.30 of input tokens, graded on ticks instead of
-five-minute bars. That run has not been done; it is the next one.
+bars gave thirty documents; the tick judge above lifts the same study to 2,187,
+on the order of $0.30 of input tokens, and puts the bid/ask and the entry
+latency into the number instead of leaving them out of it.
+
+### The run (real model, Fed 2009–2026, ticks)
+
+```bash
+python -m jevtrade.cli fx --provider jev --tape dukascopy \
+    --since 2009-01-01 --issuers fed --horizons 1,5,15,30,60 \
+    --latency 1.0 --latency-sweep --out runs/fx-jev-fed-ticks.json
+```
+
+The run has not been done yet; the numbers will go here when it has.
 
 ### What this does not show
 
@@ -895,8 +996,9 @@ Three more limits worth holding onto. Only the Fed has an archive, so the
 statistical weight will land on one central bank and one pair. Spot FX has no
 weekend, which costs sample and biases the surviving events towards weekday
 sessions. And 5-minute bars are coarse for a reaction whose first leg is
-measured in seconds — the 60-day depth of Yahoo's 5-minute series is the reason
-`--days` defaults to 60, and a serious version of this wants a proper tick feed.
+measured in seconds, which is why `--tape dukascopy` exists; the bar path is
+kept because it is the cheaper check, and because two judges disagreeing about
+an arm is worth knowing.
 
 **Weekend FX perps were probed and left as future work.** Crypto venues list
 24/7 FX perpetuals, which would cover the events the spot tape sleeps through.
@@ -925,7 +1027,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 237 tests
+python -m pytest -q      # 264 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -970,6 +1072,7 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `fx/reader.py` | the two-round tree and the sign convention |
 | `fx/baseline.py` | the word-counting bot and the rate-surprise bot |
 | `fx/tape.py` | spot FX bars, gap-aware entry and horizons |
+| `fx/ticks.py` | Dukascopy ticks: the book, the entry latency, the spread |
 | `fx/study.py` | the arms, the session-matched null, the audit |
 | `fx/mock.py` | offline stub for the FX questions |
 

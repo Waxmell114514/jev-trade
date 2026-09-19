@@ -87,6 +87,15 @@ PAIRS: dict[str, tuple[str, int]] = {
     "JPY": ("JPY=X", -1),
 }
 
+# The same pairs as Dukascopy names them, for the tick judge. Yahoo's "JPY=X"
+# is USDJPY, which is the one place the two vocabularies disagree about which
+# currency is the base, so the mapping is spelled out rather than derived.
+TICK_SYMBOLS: dict[str, str] = {
+    "EURUSD=X": "EURUSD",
+    "GBPUSD=X": "GBPUSD",
+    "JPY=X": "USDJPY",
+}
+
 STANCE_SIGN = {HAWKISH: +1, DOVISH: -1, NEUTRAL: 0}
 
 
@@ -531,6 +540,7 @@ class Reader:
 
 __all__ = [
     "DiffVerdict", "KINDS", "MAGNITUDE_LEVELS", "INTERVENTION_LEVELS", "PAIRS",
-    "Reader", "Reading", "TREE_VERSION", "Verdict", "build_state", "pair_for",
+    "Reader", "Reading", "TICK_SYMBOLS", "TREE_VERSION", "Verdict", "build_state",
+    "pair_for",
     "round_one_questions", "round_two_questions", "signed_pair", "strength",
 ]
