@@ -81,6 +81,8 @@ python -m jevtrade.cli backtest --baselines     # run and score the loop
 python -m jevtrade.cli decide                   # one decision, fully unpacked
 python -m jevtrade.cli sweep                    # what latency costs you
 python -m jevtrade.cli fetch --symbol ETH       # real bars from Kraken
+python -m jevtrade.cli listing --provider mock  # read exchange announcements
+python -m jevtrade.cli fx --provider mock       # read central banks, graded on spot FX
 ```
 
 Without `TYPESAFE_API_KEY` the loop runs against an offline stub and says so,
@@ -658,6 +660,186 @@ announcement, so the threshold sweep and every re-run score one fixed set of
 answers rather than re-sampling the model. The run has not been done yet; the
 numbers will go here when it has.
 
+## The same reader, pointed at central banks
+
+The listing study aims the reader at a feed whose incumbent is fast but cannot
+read. This one aims it at a feed whose incumbent *can* read and is slow — a
+human on a desk with two statements side by side — and where the part a machine
+can already handle is gone before anyone blinks.
+
+**The thesis, stated so it can fail.** In FX the numeric releases are priced
+within five minutes: NFP, CPI and the headline rate itself are numbers, every
+machine on the tape has them at the same millisecond, and the trade is
+subtraction. The *text* events are not. A rate-decision statement, a set of
+minutes, a press conference, a speech, a line about the exchange rate being
+"excessive and one-sided" — these keep moving price for fifteen to sixty minutes
+because somebody has to read them first. A model that answers thirty questions
+about a statement in one 400 ms round is early relative to a fifteen-minute
+digestion. That window, and nothing wider, is what `jevtrade/fx/` tests.
+
+### Why this window and not another (measured, one week, small)
+
+Median |move| in bps on the spot pair of the event's currency, over the
+ForexFactory calendar for 2026-09-14 to 09-18, Yahoo 5-minute bars:
+
+| events | n | +5m | +15m | +30m | +60m |
+|---|---:|---:|---:|---:|---:|
+| High impact, numeric | 10 | 2.2 | 5.7 | 4.2 | 6.6 |
+| High impact, text | 4 | 3.3 | **12.1** | **19.5** | **20.0** |
+| Medium impact, numeric | 7 | 1.6 | 3.6 | 1.2 | 3.5 |
+| Medium impact, text | 4 | 2.3 | 5.2 | 4.6 | 8.2 |
+
+The caveats are larger than the table: **one calendar week, four High-impact
+text events, and 5-minute bars**, which is an anecdote with a standard error,
+not a result. It is here because it is what motivated building the thing, and
+because the shape is what the thesis predicts — numeric events flat after five
+minutes, text events still going at sixty.
+
+The individual cases say the same thing more legibly. The BoJ press conference
+on 2026-09-18 moved USDJPY **0.6 bp in five minutes and 23.9 bp in fifteen**:
+nothing happens while it is being read, and then it happens. The 2026-09-16 FOMC
+statement differs from the 2026-07-29 one in **7 of its 9 sentence slots**, and
+the hike itself was on the calendar — 4.00% against 3.75% previous — so the
+number was not the news. The reading was in the changed sentences: the inflation
+paragraph went from "elevated relative to the Committee's 2 percent goal, in
+part reflecting supply shocks" to a flat "Inflation remains elevated," and the
+vote went from **9–3 with three dissents for a hike** to **12–0**.
+
+(With the site chrome left in the page, as a first pass did, the same pair of
+statements reads as 11 changed slots out of 27; the counts above are after the
+body extraction in `documents.py` throws the navigation away. Same story, fewer
+sentences.)
+
+### The feeds
+
+| source | reachable | depth | timestamp |
+|---|---|---|---|
+| `federalreserve.gov/json/ne-press.json` | yes | 4633 rows to 2006 | US Eastern local, minute; 468 old rows have none |
+| `…/ne-speeches.json` | yes | 1336 rows | same |
+| `…/ne-testimony.json` | yes | 280 rows | same |
+| Fed statement / speech pages | yes | immutable | — (body text) |
+| ECB `rss/press.html` | yes | last 15 items | RFC 2822, `+0200` |
+| BoJ `en/rss/whatsnew.xml` | yes | last 44 items | `+0900`; links are usually PDFs |
+| BoE `rss/news` | yes | last 50 items | `+0100` |
+| ForexFactory `ff_calendar_thisweek.json` | yes | **this week only** | ISO with offset |
+| Yahoo `v8/finance/chart/{sym}` | yes | 60d of 5m, 7d of 1m | epoch seconds, UTC |
+| Reuters, Bloomberg, X API | no | — | — |
+
+Only the Fed has an archive. Everything else is a window onto the last week or
+two, which is why the Fed is the primary source and the other three are there to
+show the tree is not Fed-shaped. `lastweek` and `nextweek` both 404 on the
+calendar, so a `collect` step stores the current week under an ISO-week key and
+the numeric-surprise baseline is live only for the weeks somebody ran it. No
+calendar is ever reconstructed for a past week: a consensus invented after the
+fact is not a consensus, and that arm would win for the wrong reason.
+
+### The sign convention
+
+Stated once, in one table, and tested:
+
+| issuer | currency | hawkish means | pair traded | hawkish side |
+|---|---|---|---|---|
+| Fed | USD | USD strengthens | `EURUSD=X` | short |
+| ECB | EUR | EUR strengthens | `EURUSD=X` | long |
+| BoE | GBP | GBP strengthens | `GBPUSD=X` | long |
+| BoJ | JPY | JPY strengthens | `JPY=X` (USDJPY) | short |
+
+A hawkish Fed sends EURUSD down and a hawkish BoJ sends USDJPY down, because the
+currency in question is the *quote* side of those pairs. Getting this backwards
+inverts the entire study while leaving every number plausible, so it lives in
+one dict and has its own test.
+
+### The tree
+
+**Round one, one request, everything speculative** — what kind of text this is
+(rate decision, minutes, speech or testimony, press conference or interview, FX
+or intervention comment, data or survey, operational, other), whether it is
+policy at all, which way it leans for the issuer's own currency, whether there
+is anything new in it, how big, whether the guidance moved, whether it is a
+surprise against what the text implies was expected (and against the calendar
+forecast, when a snapshot covers it), and how far it goes up a five-level
+intervention ladder: *no mention of the exchange rate → officials are watching →
+moves are "excessive or one-sided" → "ready to take decisive action", or a rate
+check → intervention announced or confirmed.*
+
+Then, for each of up to twelve sentences that changed since the previous edition
+— found by `difflib` on sentence lists, not by the model — two more questions:
+which way *that sentence* cuts, and whether the change is substance or
+rephrasing. With a full diff that is **32 questions in one round**, and width is
+free.
+
+**Round two, only if round one found something** — a decisive stance, a material
+sentence change, or intervention language near the top of the ladder. It asks
+the direction again with the framing reversed ("if you had to take a position
+for the next hour, which side?"), a holder check ("would a trader long this
+currency be unaffected?"), and the horizon. Two rephrasings of one question make
+partly independent errors; that is the cheapest redundancy there is. **No second
+round, no trade** — a document whose confirmation never ran scores zero.
+
+Every number is arithmetic on the probabilities: strength is stance × the
+reversed-framing confirmation × magnitude × policy relevance, lifted a little by
+surprise and halved by the complement of "new information". The model multiplies
+nothing.
+
+### The baselines and the grading
+
+```bash
+python -m jevtrade.cli fx --days 60                      # real key: reads with Jev
+python -m jevtrade.cli fx --days 60 --provider mock      # offline, keyword stub
+python -m jevtrade.cli fx --snapshot-calendar            # store this week's calendar
+```
+
+Four arms are scored the same way. **`keyword-bot`** counts hawkish words
+against dovish ones and trades the difference — the incumbent, and the thing to
+beat; it reads "the Committee no longer expects to raise rates and will not
+tighten further" as hawkish. **`surprise-bot`** takes the printed rate minus the
+snapshotted forecast, which is the incumbent that actually wins on numbers, and
+reports *not available* for every week without a snapshot. **`all text`** trades
+every document, so the table shows whether central-bank text moves the tape at
+all relative to nothing happening — if that arm is flat, nothing downstream
+matters. **`reader`** is the tree at a strength threshold.
+
+Every signal enters at the open of the first bar *after* the published
+timestamp — up to five minutes late on 5-minute bars, deliberately — and is
+measured by signed log return at 5, 15, 30 and 60 minutes. The null is the same
+pair and the same side at random moments within five days, drawn *only where the
+tape has bars*: spot FX is shut from about Friday 21:00 to Sunday 21:00 UTC, so
+a third of naive draws land in a hole, and a 60-minute return computed by bar
+index across a Friday close would be a 51-hour return in disguise. Horizons are
+therefore checked against the bars' own timestamps and dropped when the window
+is not contiguous. Model answers are cached per document and tree version, so
+the threshold sweep scores one fixed set of answers rather than re-sampling.
+
+The run has not been done yet; the numbers will go here when it has.
+
+### What this does not show
+
+**Feed latency is the real bottleneck, and this study cannot measure it.** A
+scheduled statement is pollable to the second — the FOMC page goes live at
+14:00:00 ET and anyone can be on it — so for rate decisions and minutes the
+published timestamp is close to honest. For everything unscheduled it is not. A
+speech is "published" when a web team gets to it; a press-conference remark
+reaches the tape through a wire headline seconds after it is spoken and hours
+before anything appears in an RSS feed, and wire feeds are not free. So a
+positive result on speeches here would say "this text was worth reading", not
+"you could have traded it", and the honest scope is the scheduled-text subset.
+
+Three more limits worth holding onto. Only the Fed has an archive, so the
+statistical weight will land on one central bank and one pair. Spot FX has no
+weekend, which costs sample and biases the surviving events towards weekday
+sessions. And 5-minute bars are coarse for a reaction whose first leg is
+measured in seconds — the 60-day depth of Yahoo's 5-minute series is the reason
+`--days` defaults to 60, and a serious version of this wants a proper tick feed.
+
+**Weekend FX perps were probed and left as future work.** Crypto venues list
+24/7 FX perpetuals, which would cover the events the spot tape sleeps through.
+Over 11 weekends, Gate's `EURUSD_USDT` drift across the closed period explains
+some of Monday's spot gap and not much of it: beta 0.36, R² 0.22, mean |gap| 8.2
+bp against mean |drift| 11.7 bp, residual s.d. 9.7 bp. Funding is effectively
+zero (Bitget's USDJPY perp printed −3.95 bp once in ten days; EURUSD was flat
+zero throughout). That is enough of a link to be interesting and too loose to
+grade a signal on, so nothing in `jevtrade/fx/` depends on it.
+
 ## Real market data
 
 ```bash
@@ -676,7 +858,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 162 tests
+python -m pytest -q      # 234 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -716,6 +898,13 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `listing/baseline.py` | the title-matching sniper bot |
 | `listing/venues.py` | 1-minute candles from Binance, OKX or Coinbase |
 | `listing/study.py` | entry rule, horizons, matched null, arms |
+| `fx/documents.py` | Fed archives + ECB/BoJ/BoE RSS, timestamps and bodies |
+| `fx/diff.py` | the previous statement, and the sentences that changed |
+| `fx/reader.py` | the two-round tree and the sign convention |
+| `fx/baseline.py` | the word-counting bot and the rate-surprise bot |
+| `fx/tape.py` | spot FX bars, gap-aware entry and horizons |
+| `fx/study.py` | the arms, the session-matched null, the audit |
+| `fx/mock.py` | offline stub for the FX questions |
 
 TypeSafe also ships first-party SDKs (`pip install typesafe-sdk`,
 `@typesafe-ai/sdk`). This repo speaks HTTP directly so the wire format stays

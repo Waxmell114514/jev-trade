@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+<title>Bank of Japan：RSS</title>
+<link>http://www.boj.or.jp/en/rss/whatsnew.xml?id=1002</link>
+<atom:link href="http://www.boj.or.jp/en/rss/whatsnew.xml?id=1002" rel="self" type="application/rss+xml" />
+<description></description>
+<item>
+<title>Change in the Guideline for Money Market Operations</title>
+<description></description>
+<pubDate>Fri, 18 Sep 2026 12:40:00 +0900</pubDate>
+<link>http://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/k260918a.pdf</link>
+<guid>http://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/k260918a.pdf</guid>
+</item>
+<item>
+<title>Amendment to &quot;Principal Terms and Conditions of Complementary Deposit Facility&quot;</title>
+<description></description>
+<pubDate>Fri, 18 Sep 2026 12:30:00 +0900</pubDate>
+<link>http://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/mpr260918b.pdf</link>
+<guid>http://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/mpr260918b.pdf</guid>
+</item>
+<item>
+<title>Amendment to &quot;Principal Terms and Conditions of the Funds-Supplying Operations to Support Financing for Climate Change Responses&quot;</title>
+<description></description>
+<pubDate>Fri, 18 Sep 2026 12:15:00 +0900</pubDate>
+<link>http://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/mpr260918a.pdf</link>
+<guid>http://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/mpr260918a.pdf</guid>
+</item>
+</channel>
+</rss>
