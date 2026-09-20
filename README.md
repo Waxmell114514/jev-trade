@@ -1167,7 +1167,77 @@ rule: the pricing sentence for what was expected, the decision verb inside
 "decided to …" for what happened, the gap between the two for the relative call.
 That is a rule and not a reading, and it should score like one.
 
-**The run has not been done yet; the numbers will go here when it has.**
+#### The run (real model, 150 statements, ticks)
+
+Run on 2026-09-20. Context assembled for all 150 (rates 150, minutes 150,
+previous statement 149, Chair speech 128, dots 44; median 10,210 characters).
+The absolute reader's answers came from the 2009–2026 run's cache unchanged; the
+context reader asked 32 questions in the median statement, 43 went to round two,
+**median 537 ms per statement, $0.052** for the lot.
+
+```
+arm              signals traded    pre   rush  sprd      +1m      +5m     +15m     +30m     +60m  hit15    z15
+reader-absolute       67     66     +3     +1   1.5       +1       +1       +3       +4       -3    50%   +0.5
+  s.e.                                                   +-2      +-3      +-4      +-5      +-6
+reader-context        14     13     +5     -1   1.4       +2       -1       -6       -3       -1    38%   -0.6
+  s.e.                                                   +-6      +-7      +-8     +-10     +-12
+bill-surprise         90     89     -0     +0   1.8       -1       -0       +2       +1       -1    51%   +0.5
+  s.e.                                                   +-2      +-3      +-4      +-4      +-5
+dots-surprise         31     31     +2     +3   1.8       +8      +14      +19      +18      +14    77%   +3.5
+  s.e.                                                   +-4      +-5      +-6      +-6      +-8
+all statements       150    149     -2     +1   1.6       -0       -1       -1       -0       -3    49%   -0.3
+  s.e.                                                   +-2      +-2      +-3      +-3      +-4
+
+what the model said the statement did, against the rate the code parsed (141 parseable):
+  actual_action agrees with the parsed decision 132/141 (94%); expected_action matches what happened 133/141 (94%)
+relative stance: in line 98, more dovish than expected 32, more hawkish than expected 20
+where it put the surprise: economic assessment 45, vote 32, balance sheet 28, rate decision 19,
+  forward guidance 15, nothing 11, projections or dots 0
+```
+
+Three things came out, in order of weight:
+
+- **The context did not fix the coin flip; it turned the reader into an
+  abstainer.** Given what the market already had, the model called 98 of 150
+  statements *in line with expectations* and cleared the trading threshold on
+  14. It read the facts right — 94% agreement with the parsed decision, 94% on
+  what was expected — and stayed out of the largest moves in both directions:
+  the ones the absolute reader had got right (2009-03-18, 2020-03-23,
+  2019-01-30) and the ones it had got wrong (2024-12-18, 2022-11-02,
+  2009-01-28). The 13 it did trade came out at −6 ± 8 bp at fifteen minutes,
+  five of thirteen right. Thirteen is not a sample; abstaining on 136 is the
+  result.
+- **The direction was in the dots, and it is a number.** The change in next
+  year's median projection against the previous SEP, on the 31 projection
+  meetings since September 2015 with a readable median: **+19 ± 6 bp at fifteen
+  minutes, 24 of 31 right** (sign test p = 0.003), +14 ± 5 at five, +14 ± 8 at
+  sixty; without the three largest moves, +14 and 24 of 28. Eighteen shorts,
+  thirteen longs. The move builds over the first quarter-hour (+8 at one minute,
+  +19 at fifteen) rather than printing at the release. This is one arm of five
+  and thirty-one observations, so it is a finding to test forward, not a
+  strategy; but it is the only signed number in this whole section that is not
+  within two standard errors of zero.
+- **The reader had the dots and did not use them.** The context carried the
+  dots as sentences ("Median projection for end-2025 moved to 3.9% from 3.4%")
+  for 44 statements, and `surprise_channel` was *projections or dots* for none
+  of them. It put the surprise in the economic assessment (45), the vote (32)
+  and the balance sheet (28), which are the parts of a statement people argue
+  about and not the parts the tape moved on. Whether that is the question's
+  framing (the dots sat under a "context" heading, the question asked about
+  "the statement") or the model, the next version of the tree should ask about
+  the projections by name.
+
+The bill-implied surprise scored nothing (89 trades, +2 ± 4), which is what a
+six-month proxy for a one-meeting expectation deserves. The absolute reader on
+statements alone reproduced its earlier +3 ± 4 at 50%.
+
+For the scalper, this closes the loop from the other side: the semantic reader
+is right about the words and no better than a coin on the direction, because
+the direction on statement days is set by a table of numbers released with
+them, and a table of numbers is not a reading job. Where Jev earned its keep
+here was in saying *nothing surprising* 98 times — the abstention is correct
+far more often than the keyword bot's trades are — and that is a risk filter,
+not a scalp.
 
 ### What this does not show
 
@@ -1216,7 +1286,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 325 tests
+python -m pytest -q      # 326 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
