@@ -74,7 +74,7 @@ distribution over options we defined.
 
 ## Quickstart
 
-No dependencies, no build step, Python 3.10+.
+No required dependencies, no build step, Python 3.10+.
 
 ```bash
 python -m jevtrade.cli backtest --baselines     # run and score the loop
@@ -84,7 +84,13 @@ python -m jevtrade.cli fetch --symbol ETH       # real bars from Kraken
 python -m jevtrade.cli listing --provider mock  # read exchange announcements
 python -m jevtrade.cli fx --provider mock       # read central banks, graded on spot FX
 python -m jevtrade.cli fx --context --provider mock  # statements read against what was priced
+python -m jevtrade.cli fx --dots                    # the dot-plot rule, no model at all
+python -m jevtrade.cli fx --presser --provider mock # the press conference, 30 minutes later
 ```
+
+`--presser` reads PDF transcripts, which is the one thing the standard library
+cannot do: `pip install 'jev-trade[pdf]'` adds `pypdf`, and without it that arm
+reports itself dark and everything else runs unchanged.
 
 Without `TYPESAFE_API_KEY` the loop runs against an offline stub and says so,
 loudly, on every report. With a key it calls the real thing:
@@ -1239,6 +1245,219 @@ here was in saying *nothing surprising* 98 times — the abstention is correct
 far more often than the keyword bot's trades are — and that is a risk filter,
 not a scalp.
 
+### Validating the dots
+
+The run above leaves one signed number outside two standard errors of zero, and
+it is not the reader: it is a table of numbers released with the statement.
+**The rule, written down before it is tested again and not rewritten
+afterwards:**
+
+> On a projection meeting, take the sign of the change in the median
+> federal-funds projection for **next year** against the previous SEP. Positive
+> is fewer cuts, a stronger dollar: short EURUSD at the statement, out at the
+> horizon.
+
+That is what `--context` found — +19 ± 6 bp at fifteen minutes, 24 of 31 right,
+sign test p = 0.003 — over 31 meetings on one pair, chosen from five arms. It is
+the kind of number that is usually a coincidence, so `fx/dots.py` and
+`jevtrade fx --dots` exist to give it four ways to fail.
+
+```bash
+python -m jevtrade.cli fx --dots --since 2012-01-01 \
+    --pairs EURUSD,USDJPY,GBPUSD --latency-sweep --workers-io 2 \
+    --out runs/fx-dots.json
+```
+
+**No model is called.** The dots are arithmetic, the sign is arithmetic, and the
+tape does the grading; there is no provider argument and nothing to pay for.
+
+**Out of sample means the years before the median was printed.** The SEP has
+carried a funds-rate *median* row only since September 2015, which is where the
+rule was found. From January 2012 — the first dot plot — the same page carries a
+**histogram**: rate levels down the rows, years across the columns, the number
+of participants at each level in the cells. The median is arithmetic on that,
+so the fifteen meetings from 2012-01 to 2015-06 are a genuine hold-out for a
+rule fitted on the printed ones. Three things about those pages had to be found
+rather than assumed:
+
+- **Blank cells vanish when the tags are stripped.** "0.50 1 2" could be one
+  participant in the first year and two in the third, or one in the second and
+  two in the fourth. So the table is read by walking `<tr>` and `<td>` and
+  keeping the column positions, not by flattening the page.
+- **The headings change three times.** 2012 writes them in Title Case
+  ("Appropriate Pace of Policy Firming"), 2013–2015 in sentence case, and from
+  March 2016 the stub column is "Midpoint of target range or target level"
+  because the target became a range. The parser finds the table by its stub
+  header, which names the funds rate in all three.
+- **December 2012 has no projection page at all.** Its SEP was published inside
+  the minutes, and its histogram is on `fomcminutes20121212epa.htm`, where the
+  rows are *buckets* ("0.38 - 0.62") rather than levels. A bucket is read as the
+  one quarter-point value it contains.
+
+**The parser is validated where both exist.** On the 44 pages from September
+2015 on that print a median row *and* the histogram, the histogram-derived
+median reproduces the printed one in **198 of 199 year-cells, 43 of 44 meetings
+exactly**. The single disagreement is the 2026-09-16 longer-run dot: eighteen
+participants, the ninth and tenth both at 3.25, so the median is exactly 3.25,
+and the page prints 3.2 — while the same page rounds 0.875 up to 0.9. The two
+cannot both be right; the histogram is what this study uses, and the
+disagreement is printed rather than reconciled. Finding that check working also
+found a real bug: the September 2015 table has a **`-0.125` row**, one
+participant projecting a negative funds rate, and a parser that only reads
+unsigned numbers moves that page's 2016 median a whole eighth away from the
+median printed six inches above it.
+
+**The hold-out is thin, and that is the first thing the run will say.** Of the
+fourteen out-of-sample meetings with a predecessor, **eight print no change at
+all**: from January 2012 to December 2013 the median projection for next year
+sat at 0.25 and never moved, because the funds rate was at its floor and the
+first hike was still two years away. Only six of the fourteen carry a sign, all
+of them between March 2014 and June 2015. Six trades will not confirm or refute
+anything; what they can do is fail loudly, and the in-sample count they are
+being compared against — 31 signed meetings out of 44 — is reproduced exactly by
+this parser, which is the part that had to be got right first.
+
+**Four variants are reported and none of them is ever chosen.** The current-year
+median, the two-years-out median, the longer-run dot, and the sum of the year
+medians are computed and printed next to the rule, labelled as variants. The
+point is not to find the best one — that is how a coincidence becomes a
+strategy — it is to let a reader see whether the rule is one lucky pick out of
+five.
+
+**Three pairs, one convention, in one dict with its own test.** A hawkish dot
+plot is a stronger dollar. The dollar is the *quote* side of EURUSD and GBPUSD
+and the *base* side of USDJPY, so the rule is short EURUSD, short GBPUSD and
+long USDJPY. Getting that backwards inverts the study while leaving every number
+plausible, which is why it is `USD_SIDE = {"EURUSD": -1, "GBPUSD": -1,
+"USDJPY": +1}` and not a derivation.
+
+**The latency sweep asks one question.** The move builds over the first quarter
+hour rather than printing at the release — +8 bp at one minute against +19 at
+fifteen — so unlike the reader's edge it might survive a human. The sweep runs
+the same signals at **0, 1, 5, 30, 120 and 300 seconds**, and the five-minute row
+is the question in the form somebody would actually ask it: *can a person who
+opens the projection table and reads one number by hand still catch this?*
+
+**The forward register.** Each run ends by parsing `fomccalendars.htm` — where
+an asterisk on the date marks a projection meeting — and printing the rule in one
+sentence and the projection meetings still ahead. As of 2026-09-20 those are
+**2026-12-09, 2027-03-17, 2027-06-09, 2027-09-15 and 2027-12-08**. The per-meeting
+records go into the `--out` JSON keyed by date, and a later run merges into that
+file rather than recomputing it, so running the same command after each of those
+dates *is* the forward test and the file accumulates it.
+
+The run has not been done yet; the numbers will go here when it has.
+
+### The press conference, thirty minutes later
+
+On 2022-11-02 the statement read one way and the press conference read the other,
+and the tape followed the press conference: the reader was short EURUSD and −66
+bp at fifteen minutes. That day is in the run's list of worst calls, and the
+statement tree cannot see it, because the thing that moved the price is a
+different document published half an hour later. `fx/presser.py` and
+`jevtrade fx --presser` are that document.
+
+```bash
+python -m jevtrade.cli fx --presser --provider jev --tape dukascopy \
+    --since 2011-01-01 --latency-sweep --workers-io 2 \
+    --out runs/fx-presser.json
+```
+
+**The sources.** Every press conference since April 2011 has a transcript at
+`…/mediacenter/files/FOMCpresconf{YYYYMMDD}.pdf`. Which meetings had one comes
+off the calendar pages — `fomccalendars.htm` for the current six years and
+`fomchistorical{YYYY}.htm` for one year each before that — both of which link
+the conference by its date. Counted over 2011 to 2026-09 that is **95
+conferences**: three in 2011, five in 2012, four a year through 2018, then every
+meeting from 2019 (nine in 2020, including the two intermeeting briefings). The
+ninety-fifth is only there because the match is deliberately loose: the Fed's own
+January 2026 row spells the link `fomcpressconf`, with two s's.
+
+**A transcript is published after the conference it records.** So, exactly as
+the speeches arm already says, this measures *"was it worth listening to"* and
+not *"could you have traded it"*. What would make it tradeable is a live
+speech-to-text feed off the video, and that is not free.
+
+**`pypdf` is an optional extra** (`pip install 'jev-trade[pdf]'`). The rest of
+this repository is standard library only and stays that way. When `pypdf` is not
+importable the module says so once and the transcript arms are reported **dark**
+— which is a result, in the same sense as the surprise bot's "not available" —
+while the arms that need only the start time still run. That path has its own
+test.
+
+**When it starts is a rule, and only half of it is measured.** From 2013 the
+statement is released at 2:00 p.m. ET and the Chair starts at 2:30, so the start
+is the statement plus thirty minutes; every FOMC statement row in the archive
+from 2013-03-20 on carries 14:00, and the Fed announced the change on
+2013-03-13, but the half hour itself is the published schedule taken on trust.
+**In 2011 and 2012 the statement went out at 12:30 p.m. and the Chair began at
+2:15**, which is checked: the April 2011 press-conference page prints "FOMC
+Meeting Statement (Released April 27, 2011 at 12:30 p.m.)" beside "Projections
+Materials … (Released April 27, 2011 at 2:15 p.m.)", and the projections were
+released as the conference opened. The archive's own minute for those statements
+is 12:35 or 12:40 — when the release was *posted*, not when it was released —
+which is why the early rule is an absolute time of day and not an offset.
+
+**Splitting the transcript** is the part most likely to rot, so the marker style
+is recorded per day. The running header (`Page 3 of 26`, or a bare `3 of 26` in
+2011, plus the dated "… Press Conference FINAL/PRELIMINARY" line) is stripped,
+and the opening remarks end at the first speaker who is not the Chair. Counted
+over all 95 transcripts, that speaker is marked three ways and all three are
+handled and tested: **`QUESTION.`** — exactly once, on 2011-04-27, and never
+again; **a reporter's name in capitals** (`JON HILSENRATH.`) from 2011-06-22,
+47 times; and **a press officer handing over** (`MICHELLE SMITH.  Steve.`) from
+2020-04-29, 47 times. Two smaller things had to be found the same way: the 2018
+transcripts punctuate the Chair's own marker with a **colon**, and the June 2024
+one leaves **one space** after the stop rather than two, either of which makes a
+parser start the "opening remarks" somewhere in the middle of the Q&A. With both
+handled the remarks run 2,400 to 14,100 characters, median 7,700, on all 95.
+
+Each half is capped at 9,000 characters for the state. On the remarks that is
+almost always the whole thing; on the Q&A, whose median is 41,300, it is a real
+cut, and what the reader gets is the **opening exchanges** — where the questions
+about the path get asked — rather than the hour.
+
+**The tree** is a third mode (`presser`, version `pc1`, its own cache tag, so
+the statement reader's `v1` answers are untouched). Its state is the statement,
+the dots sentences for the day, the opening remarks and the Q&A. Round one
+carries the whole absolute tree and adds seven questions:
+
+| id | type | asks |
+|---|---|---|
+| `remarks_vs_statement` | Choice | more hawkish / consistent / more dovish **than the statement** |
+| `qa_vs_remarks` | Choice | the same, for the answers against the Chair's own remarks |
+| `pushback_on_pricing` | Noul | did the Chair push back against how the market was pricing the path |
+| `presser_stance` | Choice | hawkish / dovish / neutral for the dollar, the conference as a whole |
+| `new_information` | Noul | relative to the statement |
+| `surprise_size` | Score | nothing the statement did not have → the kind that sets the day |
+| `dominant_topic` | Choice | inflation / labor / growth / financial conditions / balance sheet / path of rates / other |
+
+Round two runs on a decisive `presser_stance` **or** on either half not being
+*consistent* — that second door is the whole point of the mode — and asks the
+direction again reversed ("a desk that had read the statement and the dots and
+then listened to this: which side for the next hour?"), the holder check and the
+horizon. **The sign comes from `presser_stance` and never from the statement's
+`stance`**, which is what lets a 2022-11-02 point the other way. Strength is the
+context tree's arithmetic: `p(stance) × confirm × surprise_size × (1 −
+priced_in)`.
+
+**Four arms on press-conference days**, all on EURUSD ticks and all entered from
+the moment the Chair started rather than from the release: **`presser-reader`**,
+the `pc1` tree; **`statement-reader`**, that day's cached absolute reading of the
+statement carried into the conference — "what if you held the statement's read
+through it"; **`dots-rule`** from the same moment, which asks whether the dots
+move is still going half an hour on; and **`all pressers`**, the keyword bot
+pointed at the transcript. Each against the same session-matched null, with a
+latency sweep on the reader.
+
+**And a reversal table.** Every day where `remarks_vs_statement` or
+`qa_vs_remarks` was *not* consistent, printed with the tape's move from the
+release to the Chair's first word and from there to an hour later, side by side.
+That is the shape of 2022-11-02, and a table is the only way to find out whether
+that day was one of a kind or one of twenty.
+
+The run has not been done yet; the numbers will go here when it has.
+
 ### What this does not show
 
 **Feed latency is the real bottleneck, and this study cannot measure it.** A
@@ -1286,7 +1505,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 326 tests
+python -m pytest -q      # 394 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -1333,6 +1552,8 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `fx/tape.py` | spot FX bars, gap-aware entry and horizons |
 | `fx/ticks.py` | Dukascopy ticks: the book, the entry latency, the spread |
 | `fx/context.py` | the pre-release context, every item stamped and checked |
+| `fx/dots.py` | the SEP histogram, the median, the rule and the forward register |
+| `fx/presser.py` | the press-conference transcript, split at the first question |
 | `fx/study.py` | the arms, the session-matched null, the audit |
 | `fx/mock.py` | offline stub for the FX questions |
 

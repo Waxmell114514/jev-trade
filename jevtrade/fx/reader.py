@@ -15,8 +15,8 @@ trader be on", and "would a trader long this currency be unaffected" -- because
 two rephrasings of one question make partly independent errors, and that is the
 cheapest redundancy available. No second round, no trade.
 
-There are two modes. The **absolute** one is the tree above: read the text, say
-which way it leans. The **context** one adds the question the absolute tree
+There are three modes. The **absolute** one is the tree above: read the text,
+say which way it leans. The **context** one adds the question the absolute tree
 cannot ask -- *more hawkish than what?* -- because it is handed the pre-release
 context ``fx/context.py`` assembles and asks for the stance **relative** to it:
 what the market expected, what the statement did, and which way the difference
@@ -24,6 +24,16 @@ cuts. The sign of a context signal comes from ``relative_stance`` and never from
 ``stance``: on 2024-12-18 the statement was a cut and read dovish, and the
 market took it as hawkish, which is a disagreement the absolute tree has no
 vocabulary for.
+
+The **presser** mode reads the document that arrives half an hour later. It is
+handed the statement, the dots and the press conference split into the Chair's
+opening remarks and the Q&A, and asks which way each half cuts against the one
+before it. 2022-11-02 is the case it exists for: the statement read one way and
+the press conference the other, and the tape followed the press conference. Its
+sign comes from ``presser_stance``, which is the conference as a whole and not
+the statement, so a day where the two disagree points the other way -- and the
+transcript is published after the fact, so that arm measures whether the words
+were worth hearing and not whether they could have been traded.
 
 Sign convention, stated once and tested: **hawkish for the issuer's own currency
 means that currency strengthens.** Which way that pushes the *pair* depends on
@@ -44,9 +54,13 @@ TREE_VERSION = "v1"
 # The context tree is a different set of questions over a different state, so it
 # gets its own cache tag and the absolute reader's ``v1`` answers stay reusable.
 CONTEXT_VERSION = "ctx1"
-ABSOLUTE, CONTEXT = "absolute", "context"
-MODES = (ABSOLUTE, CONTEXT)
-TREE_VERSIONS = {ABSOLUTE: TREE_VERSION, CONTEXT: CONTEXT_VERSION}
+# ... and so is the press-conference tree, which reads a document published half
+# an hour after the statement against the statement and the dots.
+PRESSER_VERSION = "pc1"
+ABSOLUTE, CONTEXT, PRESSER = "absolute", "context", "presser"
+MODES = (ABSOLUTE, CONTEXT, PRESSER)
+TREE_VERSIONS = {ABSOLUTE: TREE_VERSION, CONTEXT: CONTEXT_VERSION,
+                 PRESSER: PRESSER_VERSION}
 
 
 def tree_version(mode: str = ABSOLUTE) -> str:
@@ -70,6 +84,11 @@ VERSUS_MINUTES = "versus_minutes"
 HOLDER_UNAFFECTED = "holder_unaffected"
 STANCE_REVERSED = "stance_reversed"
 HORIZON = "horizon"
+REMARKS_VS_STATEMENT = "remarks_vs_statement"
+QA_VS_REMARKS = "qa_vs_remarks"
+PUSHBACK_ON_PRICING = "pushback_on_pricing"
+PRESSER_STANCE = "presser_stance"
+DOMINANT_TOPIC = "dominant_topic"
 
 RATE_DECISION = "rate_decision"
 MINUTES = "minutes"
@@ -115,6 +134,19 @@ CHANNELS = (
 
 VS_MORE_HAWKISH, VS_CONSISTENT, VS_MORE_DOVISH = "more_hawkish", "consistent", "more_dovish"
 VERSUS_OPTIONS = (VS_MORE_HAWKISH, VS_CONSISTENT, VS_MORE_DOVISH)
+
+# What a press conference spent its hour on. Asked as a choice rather than
+# inferred from word counts, because "we talked about the balance sheet" and
+# "the word balance sheet appeared eleven times" are different claims.
+INFLATION_TOPIC = "inflation"
+LABOR_TOPIC = "labor"
+GROWTH_TOPIC = "growth"
+CONDITIONS_TOPIC = "financial_conditions"
+BALANCE_SHEET_TOPIC = "balance_sheet"
+PATH_TOPIC = "path_of_rates"
+OTHER_TOPIC = "other"
+TOPICS = (INFLATION_TOPIC, LABOR_TOPIC, GROWTH_TOPIC, CONDITIONS_TOPIC,
+          BALANCE_SHEET_TOPIC, PATH_TOPIC, OTHER_TOPIC)
 
 SURPRISE_LEVELS = (
     "nothing the market did not already have",
@@ -290,6 +322,88 @@ def context_questions(currency: str) -> dict[str, dict[str, Any]]:
     }
 
 
+def presser_questions(currency: str) -> dict[str, dict[str, Any]]:
+    """The seven the press conference adds: the two halves, the push-back, the topic.
+
+    Every one of these is answered against the ``press_conference`` block in the
+    state, and the first two are the reason the mode exists: a Chair who reads
+    the statement one way in the prepared remarks and another way under
+    questioning is what 2022-11-02 was, and the statement tree cannot see it
+    because it is a different document half an hour later.
+    """
+    money = currency or "the issuing central bank's currency"
+    return {
+        REMARKS_VS_STATEMENT: {
+            "type": "choice",
+            "instructions": (
+                "Set the Chair's opening remarks against the statement released half "
+                "an hour earlier. Which way do the remarks cut relative to it?"
+            ),
+            "criteria": {
+                VS_MORE_HAWKISH: "The remarks are firmer than the statement was.",
+                VS_CONSISTENT: "The remarks say what the statement said.",
+                VS_MORE_DOVISH: "The remarks are softer than the statement was.",
+            },
+        },
+        QA_VS_REMARKS: {
+            "type": "choice",
+            "instructions": (
+                "Now set the answers to reporters' questions against the Chair's own "
+                "opening remarks. Which way does the Q&A cut relative to them?"
+            ),
+            "criteria": {
+                VS_MORE_HAWKISH: "Under questioning the Chair came out firmer.",
+                VS_CONSISTENT: "The answers stay with the opening remarks.",
+                VS_MORE_DOVISH: "Under questioning the Chair came out softer.",
+            },
+        },
+        PUSHBACK_ON_PRICING: _noul(
+            "Did the Chair push back against the way the market was pricing the "
+            "path of policy -- rejecting what a question said markets expect?",
+            "The Chair contradicted or resisted a stated market expectation about "
+            "the path, the timing or the size of the next moves.",
+            "The Chair let the premise of the question stand, or was never asked.",
+        ),
+        PRESSER_STANCE: {
+            "type": "choice",
+            "instructions": (
+                f"Taken as a whole -- the remarks and the answers together -- which "
+                f"way does this press conference lean for {money}?"
+            ),
+            "criteria": {
+                HAWKISH: (
+                    f"Tighter than the reader came in expecting. Supportive of {money}."
+                ),
+                DOVISH: f"Easier than the reader came in expecting. A weight on {money}.",
+                NEUTRAL: "It leans neither way, or the two sides are evenly balanced.",
+            },
+        },
+        SURPRISE_SIZE: {
+            "type": "score",
+            "instructions": (
+                "How much did this press conference add to what the statement and the "
+                "projections had already said?"
+            ),
+            "criteria": list(SURPRISE_LEVELS),
+        },
+        DOMINANT_TOPIC: {
+            "type": "choice",
+            "instructions": "What did this press conference mostly turn out to be about?",
+            "criteria": {
+                INFLATION_TOPIC: "Inflation: where it is, why, and what it takes to bring it down.",
+                LABOR_TOPIC: "The labour market: hiring, unemployment, wages.",
+                GROWTH_TOPIC: "Activity and growth: demand, output, recession risk.",
+                CONDITIONS_TOPIC: (
+                    "Financial conditions: markets, credit, banks, financial stability."
+                ),
+                BALANCE_SHEET_TOPIC: "The balance sheet: holdings, runoff, reserves, operations.",
+                PATH_TOPIC: "The path of rates itself: the next move, the pace, how far.",
+                OTHER_TOPIC: "Something else -- politics, staffing, the institution, an incident.",
+            },
+        },
+    }
+
+
 def round_one_questions(
     currency: str, changes: Sequence[tuple[str, str]], *, mode: str = ABSOLUTE
 ) -> dict[str, dict[str, Any]]:
@@ -400,11 +514,46 @@ def round_one_questions(
         # Width is free, so the context mode carries the whole absolute tree and
         # adds to it; the two readings are then comparable question by question.
         questions.update(context_questions(currency))
+    elif mode == PRESSER:
+        questions.update(presser_questions(currency))
     return questions
 
 
 def round_two_questions(currency: str, *, mode: str = ABSOLUTE) -> dict[str, dict[str, Any]]:
     money = currency or "this currency"
+    if mode == PRESSER:
+        return {
+            HOLDER_UNAFFECTED: _noul(
+                f"Would a trader who is long {money}, had read the statement and the "
+                "projections, and then listened to this press conference have no "
+                "reason to change their position?",
+                "The conference added nothing the statement and the dots had not "
+                f"already said about {money}.",
+                f"A {money} holder who had read the statement would want to act on this.",
+            ),
+            STANCE_REVERSED: {
+                "type": "choice",
+                "instructions": (
+                    f"Forget the question of tone. A desk that had read the statement "
+                    f"and the dots and then listened to this press conference: which "
+                    f"side of {money} for the next hour?"
+                ),
+                "criteria": {
+                    BUY: f"Buy {money}: the conference was firmer than the statement left it.",
+                    SELL: f"Sell {money}: the conference was softer than the statement left it.",
+                    NEITHER: "Neither side: the conference changed nothing.",
+                },
+            },
+            HORIZON: {
+                "type": "choice",
+                "instructions": "Over what horizon would this text move the exchange rate?",
+                "criteria": {
+                    MINUTES_H: "Minutes: it is priced almost at once and then done.",
+                    HOURS_H: "Hours: it takes a session to be read and absorbed.",
+                    DAYS_H: "Days or more: it changes the path, not the level.",
+                },
+            },
+        }
     if mode == CONTEXT:
         return {
             HOLDER_UNAFFECTED: _noul(
@@ -477,6 +626,7 @@ def build_state(
     calendar: dict[str, Any] | None = None,
     so_far: dict[str, Any] | None = None,
     context: str = "",
+    presser: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "issuer": document.issuer.upper(),
@@ -510,6 +660,12 @@ def build_state(
         # asserted there to predate the release. It goes in as one block of
         # prose because that is what it is: sentences, not features.
         state["context_before_the_release"] = context
+    if presser:
+        # The document published half an hour after the one in ``body``: the
+        # Chair's opening remarks and the Q&A, split by ``fx/presser.py``. It
+        # goes in beside the statement rather than instead of it, because every
+        # question the mode asks is a comparison between the two.
+        state["press_conference"] = presser
     if so_far:
         state["first_round_verdicts"] = so_far
     return state
@@ -613,6 +769,14 @@ class Reading:
     surprise_size: float = 0.0
     versus_minutes: str = ""
     context_chars: int = 0
+    # Presser mode only; empty strings and zeros on the other two.
+    presser_stance: str = ""
+    p_presser: float = 0.0
+    remarks_vs_statement: str = ""
+    qa_vs_remarks: str = ""
+    pushback: float = 0.0
+    dominant_topic: str = ""
+    presser_chars: int = 0
     responses: list[JevResponse] = field(default_factory=list, repr=False)
 
     @property
@@ -666,6 +830,7 @@ class Reader:
         changes: Sequence[tuple[str, str]] = (),
         calendar: dict[str, Any] | None = None,
         context: str = "",
+        presser: dict[str, Any] | None = None,
     ) -> Reading:
         started = time.perf_counter()
         changes = list(changes)[: self.max_diffs]
@@ -676,7 +841,7 @@ class Reader:
             questions,
             build_state(
                 document, changes, round_no=1, body_chars=self.body_chars,
-                previous=previous, calendar=calendar, context=context,
+                previous=previous, calendar=calendar, context=context, presser=presser,
             ),
         )
         kind = first.choice(KIND)
@@ -707,6 +872,9 @@ class Reader:
         expected = actual = relative = channel = versus = ""
         p_expected = p_actual = p_relative = p_channel = surprise_size = 0.0
         relative_confidence = 0.0
+        # ... and the press-conference answers, or blanks when this is not that tree.
+        presser_stance = remarks_vs = qa_vs = topic = ""
+        p_presser = pushback = presser_confidence = 0.0
         if self.mode == CONTEXT:
             expected_answer = first.choice(EXPECTED_ACTION)
             actual_answer = first.choice(ACTUAL_ACTION)
@@ -728,6 +896,22 @@ class Reader:
             # calls in-line but enormous is exactly the case worth a re-ask.
             decisive = relative != IN_LINE and p_relative >= self.stance_floor
             material = surprise_size >= self.surprise_floor
+            loud = False
+        elif self.mode == PRESSER:
+            stance_answer = first.choice(PRESSER_STANCE)
+            presser_stance = stance_answer.choice
+            p_presser = stance_answer.p(presser_stance)
+            presser_confidence = stance_answer.confidence
+            remarks_vs = first.choice(REMARKS_VS_STATEMENT).choice
+            qa_vs = first.choice(QA_VS_REMARKS).choice
+            pushback = first.noul(PUSHBACK_ON_PRICING).noul
+            topic = first.choice(DOMINANT_TOPIC).choice
+            surprise_size = first.score(SURPRISE_SIZE).normalized
+            # Round two runs on a decisive call *or* on any disagreement between
+            # the statement, the remarks and the answers -- the second door is
+            # the whole point of the mode, so it opens on its own.
+            decisive = presser_stance != NEUTRAL and p_presser >= self.stance_floor
+            material = VS_CONSISTENT != remarks_vs or VS_CONSISTENT != qa_vs
             loud = False
         else:
             decisive = stance.choice != NEUTRAL and stance.p(stance.choice) >= self.stance_floor
@@ -751,26 +935,56 @@ class Reader:
                     "relative_stance": relative, "surprise_channel": channel,
                     "surprise_size": round(surprise_size, 3),
                 })
+            elif self.mode == PRESSER:
+                so_far.update({
+                    "presser_stance": presser_stance,
+                    "remarks_vs_statement": remarks_vs, "qa_vs_remarks": qa_vs,
+                    "pushback_on_pricing": round(pushback, 3),
+                    "dominant_topic": topic, "surprise_size": round(surprise_size, 3),
+                })
             second_questions = round_two_questions(currency, mode=self.mode)
             second = self._ask(
                 second_questions,
                 build_state(
                     document, changes, round_no=2, body_chars=self.body_chars,
                     previous=previous, calendar=calendar, so_far=so_far, context=context,
+                    presser=presser,
                 ),
             )
             responses.append(second)
             asked += len(second_questions)
             side = second.choice(STANCE_REVERSED)
-            lean = (RELATIVE_STANCES.get(relative, NEUTRAL) if self.mode == CONTEXT
-                    else stance.choice)
+            if self.mode == CONTEXT:
+                lean = RELATIVE_STANCES.get(relative, NEUTRAL)
+            elif self.mode == PRESSER:
+                lean = presser_stance
+            else:
+                lean = stance.choice
             want = {HAWKISH: BUY, DOVISH: SELL}.get(lean)
             agree = side.p(want) if want else 0.0
             confirm = (1.0 - second.noul(HOLDER_UNAFFECTED).noul) * agree
             horizon = second.choice(HORIZON).choice
 
         verdict: Verdict | None = None
-        if self.mode == CONTEXT:
+        if self.mode == PRESSER:
+            # The sign is the press conference's own stance, never the
+            # statement's: the whole reason to read the transcript is the day
+            # the two disagree. The strength is the context tree's arithmetic,
+            # because "the statement already had this" is again a complete
+            # answer and deserves no half-measure damper.
+            signed = signed_pair(currency, presser_stance)
+            if signed is not None:
+                symbol, sign = signed
+                verdict = Verdict(
+                    pair=symbol,
+                    sign=sign,
+                    p_side=p_presser,
+                    confidence=presser_confidence,
+                    strength=context_strength(
+                        p_presser, confirm, surprise_size, 1.0 - new_information,
+                    ),
+                )
+        elif self.mode == CONTEXT:
             signed = signed_pair(currency, RELATIVE_STANCES.get(relative, NEUTRAL))
             if signed is not None:
                 symbol, sign = signed
@@ -833,6 +1047,13 @@ class Reader:
             surprise_size=surprise_size,
             versus_minutes=versus,
             context_chars=len(context),
+            presser_stance=presser_stance,
+            p_presser=p_presser,
+            remarks_vs_statement=remarks_vs,
+            qa_vs_remarks=qa_vs,
+            pushback=pushback,
+            dominant_topic=topic,
+            presser_chars=sum(len(str(v)) for v in (presser or {}).values()),
             responses=responses,
         )
 
@@ -840,9 +1061,10 @@ class Reader:
 __all__ = [
     "ABSOLUTE", "ACTIONS", "ACTION_RANK", "CHANNELS", "CONTEXT", "CONTEXT_VERSION",
     "DiffVerdict", "KINDS", "MAGNITUDE_LEVELS", "INTERVENTION_LEVELS", "MODES", "PAIRS",
-    "RELATIVE_OPTIONS", "RELATIVE_STANCES", "Reader", "Reading", "SURPRISE_LEVELS",
-    "TICK_SYMBOLS", "TREE_VERSION", "TREE_VERSIONS", "VERSUS_OPTIONS", "Verdict",
+    "PRESSER", "PRESSER_VERSION", "RELATIVE_OPTIONS", "RELATIVE_STANCES", "Reader",
+    "Reading", "SURPRISE_LEVELS", "TICK_SYMBOLS", "TOPICS", "TREE_VERSION",
+    "TREE_VERSIONS", "VERSUS_OPTIONS", "Verdict",
     "build_state", "context_questions", "context_strength", "pair_for",
-    "round_one_questions", "round_two_questions", "signed_pair", "strength",
-    "tree_version",
+    "presser_questions", "round_one_questions", "round_two_questions",
+    "signed_pair", "strength", "tree_version",
 ]

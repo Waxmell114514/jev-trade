@@ -644,6 +644,7 @@ def state_hash(
     *,
     body_chars: int = 6000,
     context: str = "",
+    extra: str = "",
 ) -> str:
     """A short digest of everything round one will see besides the tree itself.
 
@@ -665,6 +666,10 @@ def state_hash(
     # exactly what it was and the absolute reader's cache is still valid.
     if context:
         parts.append(hashlib.sha1(context.encode("utf-8")).hexdigest()[:10])
+    # Anything else round one will see -- today, the press-conference block.
+    # Appended only when there is one, for the same reason as ``context``.
+    if extra:
+        parts.append(hashlib.sha1(extra.encode("utf-8")).hexdigest()[:10])
     payload = json.dumps(parts, ensure_ascii=False)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
 
@@ -680,6 +685,7 @@ def read_all(
     workers: int = 1,
     body_chars: int = 6000,
     contexts: dict[str, str] | None = None,
+    pressers: dict[str, dict[str, Any]] | None = None,
     progress: Callable[[int, int, int, float], None] | None = None,
     progress_every: int = 100,
 ) -> list[Reading]:
@@ -692,7 +698,9 @@ def read_all(
 
     ``contexts`` maps a document id to the pre-release context block the reader
     should be handed, and is part of the cache key: two readings of the same
-    statement against different context are different readings.
+    statement against different context are different readings. ``pressers``
+    does the same for the press conference that followed it, and is in the key
+    for the same reason.
 
     ``progress`` is called with ``(done, total, went to round two, dollars so
     far)`` every ``progress_every`` documents, because a 2,300-document run is
@@ -714,8 +722,11 @@ def read_all(
         previous, changes = diff_for(document, editions, limit=max_diffs)
         row = match_calendar(document, rows) if rows else None
         context = (contexts or {}).get(document.id, "")
-        key = (f"reading:{cache_tag}:{document.id}:"
-               f"{state_hash(document, changes, row, body_chars=body_chars, context=context)}")
+        presser = (pressers or {}).get(document.id)
+        extra = json.dumps(presser, sort_keys=True, ensure_ascii=False) if presser else ""
+        digest = state_hash(document, changes, row, body_chars=body_chars,
+                            context=context, extra=extra)
+        key = f"reading:{cache_tag}:{document.id}:{digest}"
         result: Reading | None = None
         if store is not None:
             found, data = store.get(key)
@@ -723,7 +734,7 @@ def read_all(
                 result = reading_from_dict(document, data)
         if result is None:
             result = reader().read(document, previous=previous, changes=changes,
-                                   calendar=row, context=context)
+                                   calendar=row, context=context, presser=presser)
             if store is not None:
                 store.put(key, reading_to_dict(result))
         with guard:
@@ -758,6 +769,11 @@ def reading_to_dict(reading: Reading) -> dict[str, Any]:
         "p_relative": reading.p_relative, "surprise_channel": reading.surprise_channel,
         "p_channel": reading.p_channel, "surprise_size": reading.surprise_size,
         "versus_minutes": reading.versus_minutes, "context_chars": reading.context_chars,
+        "presser_stance": reading.presser_stance, "p_presser": reading.p_presser,
+        "remarks_vs_statement": reading.remarks_vs_statement,
+        "qa_vs_remarks": reading.qa_vs_remarks, "pushback": reading.pushback,
+        "dominant_topic": reading.dominant_topic,
+        "presser_chars": reading.presser_chars,
         "diffs": [
             {"index": d.index, "was": d.was, "now": d.now, "stance": d.stance,
              "p_stance": d.p_stance, "material": d.material}
@@ -794,6 +810,11 @@ def reading_from_dict(document: Document, data: dict[str, Any]) -> Reading:
         surprise_size=data.get("surprise_size", 0.0),
         versus_minutes=data.get("versus_minutes", ""),
         context_chars=data.get("context_chars", 0),
+        presser_stance=data.get("presser_stance", ""), p_presser=data.get("p_presser", 0.0),
+        remarks_vs_statement=data.get("remarks_vs_statement", ""),
+        qa_vs_remarks=data.get("qa_vs_remarks", ""), pushback=data.get("pushback", 0.0),
+        dominant_topic=data.get("dominant_topic", ""),
+        presser_chars=data.get("presser_chars", 0),
     )
 
 

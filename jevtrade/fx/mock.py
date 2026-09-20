@@ -7,6 +7,14 @@ words, spots five intervention phrases, and guesses the kind from the title.
 That makes the offline ``jev`` arm a slightly better-dressed keyword bot, and it
 should score like one. The gap between that and the real model is the result.
 
+In presser mode it gets no cleverer either: it counts the same words over the
+Chair's opening remarks and over the Q&A separately and calls the difference
+between the two halves the disagreement, picks the topic by which family of
+words appears most, and reads "push-back against the market's pricing" off five
+fixed phrases. A transcript where the Chair says the opposite of the statement
+in careful words and the same words throughout will read as *consistent*, which
+is exactly the failure the real model is there to avoid.
+
 In context mode it gets one more trick and no more intelligence: it reads the
 *pricing sentence* the context block carries ("prices roughly two quarter-point
 cuts within six months") for what the market expected, the decision verb in the
@@ -66,6 +74,27 @@ _CHANNEL_PATTERNS = (
      R.BALANCE_SHEET_CHANNEL),
     (re.compile(r"forward guidance|anticipates?|in determining the (extent|timing)", re.I),
      R.GUIDANCE_CHANNEL),
+)
+
+# Push-back against how the market was pricing the path, as five phrases a
+# transcript actually uses. This is a rule and it is a poor one: a Chair who
+# says "I would not want to endorse that characterisation" defeats it.
+_PUSHBACK = re.compile(
+    r"(?i)(?:market|markets|you|that)\s+(?:are|is|have|has)?\s*(?:pricing|priced)|"
+    r"not what (?:we|the committee)|premature to|would not (?:say|characterize)|"
+    r"(?:don't|do not) (?:agree|think that's right)")
+# Which family of words a press conference spent its hour on. Counting, not
+# reading, and labelled as counting.
+_TOPIC_WORDS = (
+    (R.INFLATION_TOPIC, re.compile(r"(?i)\binflation|\bprices?\b|\bPCE\b|\bCPI\b")),
+    (R.LABOR_TOPIC, re.compile(r"(?i)\blabor|\blabour|\bemployment|\bjobs?\b|\bwages?\b")),
+    (R.GROWTH_TOPIC, re.compile(r"(?i)\bgrowth\b|\bGDP\b|\bdemand\b|\brecession\b")),
+    (R.CONDITIONS_TOPIC,
+     re.compile(r"(?i)financial conditions|\bbanks?\b|\bcredit\b|\bmarkets?\b")),
+    (R.BALANCE_SHEET_TOPIC,
+     re.compile(r"(?i)balance sheet|\breserves\b|runoff|\bholdings\b|reinvest")),
+    (R.PATH_TOPIC,
+     re.compile(r"(?i)\bpath\b|\bpace\b|next meeting|\bcuts?\b|\bhikes?\b|\bdots?\b")),
 )
 
 _KIND_PATTERNS = (
@@ -139,6 +168,23 @@ def surprise_channel(text: str, rate_surprise: bool) -> str:
     return R.NO_CHANNEL
 
 
+def versus(later: str, earlier: str) -> str:
+    """Two word-count leans -> more hawkish / consistent / more dovish."""
+    gap = R.STANCE_SIGN.get(later, 0) - R.STANCE_SIGN.get(earlier, 0)
+    if gap > 0:
+        return R.VS_MORE_HAWKISH
+    if gap < 0:
+        return R.VS_MORE_DOVISH
+    return R.VS_CONSISTENT
+
+
+def dominant_topic(text: str) -> str:
+    """The topic family with the most hits, or ``other`` when nothing scores."""
+    counts = [(len(pattern.findall(text or "")), topic) for topic, pattern in _TOPIC_WORDS]
+    best, topic = max(counts, default=(0, R.OTHER_TOPIC))
+    return topic if best else R.OTHER_TOPIC
+
+
 def _kind(title: str, feed_kind: str) -> str:
     for pattern, kind in _KIND_PATTERNS:
         if pattern.search(title or ""):
@@ -168,6 +214,12 @@ class MockFxClient:
         level = 2.6 if kind == R.RATE_DECISION else (1.6 if talky else 0.6)
         currency = str(state.get("currency", ""))
         context = str(state.get("context_before_the_release", ""))
+        presser = state.get("press_conference") or {}
+        remarks = str(presser.get("opening_remarks", ""))
+        qa = str(presser.get("question_and_answer", ""))
+        presser_lean = _lean(f"{remarks}\n{qa}")[0] if presser else R.NEUTRAL
+        remarks_vs = versus(_lean(remarks)[0], stance) if presser else R.VS_CONSISTENT
+        qa_vs = versus(_lean(qa)[0], _lean(remarks)[0]) if presser else R.VS_CONSISTENT
         expected = expected_action(context)
         did = actual_action(text)
         relative = relative_stance(expected, did)
@@ -175,7 +227,9 @@ class MockFxClient:
         # Size follows the rule's own confidence: a rate surprise is the day, a
         # channel with no rate surprise is a nuance, and nothing is nothing.
         size = 3.0 if relative != R.IN_LINE else (1.0 if channel != R.NO_CHANNEL else 0.0)
-        if state.get("round") == 2 and context:
+        if state.get("round") == 2 and presser:
+            want = {R.HAWKISH: R.BUY, R.DOVISH: R.SELL}.get(presser_lean, R.NEITHER)
+        elif state.get("round") == 2 and context:
             want = {R.MORE_HAWKISH: R.BUY, R.MORE_DOVISH: R.SELL}.get(relative, R.NEITHER)
         else:
             want = {R.HAWKISH: R.BUY, R.DOVISH: R.SELL}.get(stance, R.NEITHER)
@@ -197,8 +251,24 @@ class MockFxClient:
                 answers[key] = _choice(relative, options, 0.45 + 0.35 * lopsided)
             elif key == R.SURPRISE_CHANNEL:
                 answers[key] = _choice(channel, options, 0.5)
+            elif key == R.PRESSER_STANCE:
+                answers[key] = _choice(presser_lean, options, 0.45 + 0.45 * lopsided)
+            elif key == R.REMARKS_VS_STATEMENT:
+                answers[key] = _choice(remarks_vs, options, 0.6)
+            elif key == R.QA_VS_REMARKS:
+                answers[key] = _choice(qa_vs, options, 0.6)
+            elif key == R.PUSHBACK_ON_PRICING:
+                answers[key] = NoulAnswer(noul=0.7 if _PUSHBACK.search(qa) else 0.2)
+            elif key == R.DOMINANT_TOPIC:
+                answers[key] = _choice(dominant_topic(f"{remarks}\n{qa}"), options, 0.5)
             elif key == R.SURPRISE_SIZE:
-                answers[key] = _score(size, options)
+                # In presser mode the size is how far the two halves and the
+                # statement drifted apart; elsewhere it is the rate surprise.
+                level = size
+                if presser:
+                    level = 1.0 + sum(
+                        1.0 for v in (remarks_vs, qa_vs) if v != R.VS_CONSISTENT)
+                answers[key] = _score(level, options)
             elif key == R.VERSUS_MINUTES:
                 answers[key] = _choice(
                     {R.MORE_HAWKISH: R.VS_MORE_HAWKISH,
@@ -276,5 +346,6 @@ def _score(level: float, levels: list[str]) -> ScoreAnswer:
 
 __all__ = [
     "DOVISH_WORDS", "HAWKISH_WORDS", "MockFxClient", "actual_action",
-    "expected_action", "relative_stance", "surprise_channel",
+    "dominant_topic", "expected_action", "relative_stance", "surprise_channel",
+    "versus",
 ]

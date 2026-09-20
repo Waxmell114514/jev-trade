@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Iterable
 
 from .baselines import registry, run_rule
@@ -639,7 +639,8 @@ def cmd_fx_context(args: argparse.Namespace) -> int:
 
     store = Store(args.cache)
     horizons = tuple(int(h) for h in args.horizons.split(","))
-    ticks = args.tape == "dukascopy"
+    tape_name = args.tape or "yahoo"
+    ticks = tape_name == "dukascopy"
     now = time.time()
     since = day_epoch(args.since) if args.since else now - args.days * 86400
     until = day_epoch(args.until) + 86400 if args.until else now
@@ -920,7 +921,7 @@ def cmd_fx_context(args: argparse.Namespace) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({
             "provider": provider, "tree": R.CONTEXT_VERSION, "mode": "context",
-            "since": since, "until": until, "tape": args.tape,
+            "since": since, "until": until, "tape": tape_name,
             "latency_s": args.latency if ticks else None,
             "threshold": args.threshold, "horizons": horizons,
             "context_chars": args.context_chars,
@@ -977,8 +978,611 @@ def cmd_fx_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def _arms_table(summaries, horizons, *, ticks: bool) -> None:
+    """The table every arm in this repository is printed in, one row plus its error."""
+    hz = "".join(f"{'+' + str(h) + 'm':>9}" for h in horizons)
+    lead = f"{'pre':>7}{'rush':>7}{'sprd':>6}" if ticks else f"{'pre':>7}{'bar':>7}"
+    print(f"\n{'arm':<22}{'signals':>8}{'traded':>7}{lead}{hz}{'hit15':>7}{'z15':>7}")
+    print("-" * (22 + 8 + 7 + len(lead) + 9 * len(horizons) + 14))
+    for s in summaries:
+        cells = "".join(f"{s.fwd[h].mean:>+9.0f}" for h in horizons)
+        values = (f"{s.pre.mean:>+7.0f}{s.rush.mean:>+7.0f}{s.spread.mean:>6.1f}" if ticks
+                  else f"{s.pre.mean:>+7.0f}{s.release_bar.mean:>+7.0f}")
+        blank = " " * len(lead)
+        # An arm with nothing in it has no hit rate and no z; the null's own
+        # error would otherwise print one.
+        tail = (f"{s.hit.get(15, 0.0):>7.0%}{s.z.get(15, 0.0):>+7.1f}" if s.measured
+                else f"{'-':>7}{'-':>7}")
+        print(f"{s.name:<22}{s.signals:>8}{s.measured:>7}{values}{cells}{tail}")
+        errs = "".join(f"{'+-' + format(s.fwd[h].se, '.0f'):>9}" for h in horizons)
+        null = "".join(f"{s.null[h].mean:>+9.0f}" for h in horizons)
+        print(f"{'  s.e.':<22}{'':>8}{'':>7}{blank}{errs}")
+        print(f"{'  null':<22}{'':>8}{'':>7}{blank}{null}")
+        if s.note:
+            print(f"  ({s.note})")
+
+
+def cmd_fx_dots(args: argparse.Namespace) -> int:
+    """Validate the dots rule out of sample and forward. No model is called at all.
+
+    The rule came out of the context run: the sign of the change in next year's
+    median funds-rate projection against the previous SEP, +19 +- 6 bp of
+    EURUSD at fifteen minutes over 31 projection meetings. This command tests
+    it where it was not found -- the histogram years before the printed median,
+    two more pairs, six entry latencies -- and prints the meetings still ahead
+    so that running it again after each one is the forward test.
+    """
+    import concurrent.futures
+    import statistics
+    import time
+    from pathlib import Path
+
+    from .fx import dots as X
+    from .fx import study as S
+    from .listing.store import Store
+
+    store = Store(args.cache)
+    horizons = X.horizon_default(args.horizons)
+    # Both of these modes reach years back, where there are no 5-minute bars, so
+    # ticks are the default judge and ``--tape yahoo`` is the deliberate opt-out.
+    tape_name = args.tape or "dukascopy"
+    ticks = tape_name == "dukascopy"
+    now = time.time()
+    since = X.day_epoch(args.since) if args.since else X.day_epoch("2012-01-01")
+    until = X.day_epoch(args.until) + 86400 if args.until else now
+    if until <= since:
+        print("--until is not after --since", file=sys.stderr)
+        return 1
+    pairs = [p.strip().upper() for p in args.pairs.split(",") if p.strip()]
+    unknown = [p for p in pairs if p not in X.USD_SIDE]
+    if unknown:
+        print(f"unknown pair(s): {', '.join(unknown)}; known: "
+              f"{', '.join(sorted(X.USD_SIDE))}", file=sys.stderr)
+        return 1
+
+    meetings = X.meeting_dates(store, since=since, until=until)
+    if not meetings:
+        print("no FOMC statements in range", file=sys.stderr)
+        return 1
+    print(f"{len(meetings)} FOMC statements, {X.pretty_date(meetings[0]['date'])} to "
+          f"{X.pretty_date(meetings[-1]['date'])} (the window is opened "
+          f"{int(X.previous_window(0) / -86400)} days early so the first meeting has a "
+          f"previous SEP)")
+
+    def probe(row):
+        return X.probe_projection(store, row["date"], ts=row["ts"])
+
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.workers_io)) as pool:
+        probed = list(pool.map(probe, meetings))
+    projections = [p for p, _why in probed if p is not None]
+    unreadable = [(row["date"], why) for row, (p, why) in zip(meetings, probed)
+                  if p is None and "no projection page" not in why]
+    early = [p for p in projections if not p.in_sample]
+    late = [p for p in projections if p.in_sample]
+    print(f"projection tables: {len(projections)} parsed "
+          f"({len(early)} before the printed median row, {len(late)} from "
+          f"{X.pretty_date(X.FIRST_PRINTED_MEDIAN)} on)")
+    if unreadable:
+        print(f"  {len(unreadable)} page(s) answered and did not parse:")
+        for date, why in unreadable[: args.show]:
+            print(f"    {X.pretty_date(date)}: {why}")
+
+    agreed = compared = 0
+    notes: list[str] = []
+    with_printed = 0
+    for projection in projections:
+        if not projection.printed:
+            continue
+        with_printed += 1
+        a, c, n = projection.agreement()
+        agreed, compared, notes = agreed + a, compared + c, notes + n
+    print(f"histogram against the printed median: {agreed}/{compared} year-cells agree "
+          f"over {with_printed} meetings that print both")
+    for note in notes[: args.show]:
+        print(f"    {note}")
+
+    rows = X.records(projections)
+    print(f"{X.describe_window(rows)}; the rule signs "
+          f"{sum(1 for r in rows if r.rule is not None and r.rule.sign)} of them")
+
+    tapes = S.TickTapes(store, workers=args.workers_io) if ticks else S.Tape(
+        store, bar_min=args.bar, days=60)
+    graded = dict(horizons=horizons, workers=args.workers_io, latency_s=args.latency)
+    summaries: list[S.ArmSummary] = []
+    per_pair: dict[str, list[S.Outcome]] = {}
+    sweep: list[S.ArmSummary] = []
+
+    def sample_of(code: str) -> str:
+        date = code.rsplit(":", 1)[-1]
+        return "in-sample" if date >= X.FIRST_PRINTED_MEDIAN else "out-of-sample"
+
+    for pair in pairs:
+        pooled = X.signals(rows, pair)
+        outcomes = S.measure(tapes, pooled, **graded)
+        nulls = S.measure(tapes, S.null_signals(tapes, outcomes, per=args.null_per,
+                                                horizons=horizons, latency_s=args.latency,
+                                                workers=args.workers_io), **graded)
+        per_pair[pair] = outcomes
+        for label in ("in-sample", "out-of-sample", "pooled"):
+            chosen = [o for o in outcomes
+                      if label == "pooled" or sample_of(o.signal.code) == label]
+            chosen_signals = [s for s in pooled
+                              if label == "pooled" or sample_of(s.code) == label]
+            note = "" if label != "pooled" else "both halves, one convention"
+            summaries.append(S.summarize(f"{pair} {label}", chosen_signals, chosen, nulls,
+                                         horizons=horizons, note=note,
+                                         latency_s=args.latency if ticks else 0.0))
+
+    print("\nSigned log return per signal, bps, on the dots rule"
+          + (f", entering on the first tick at\nor after the release + {args.latency:g}s, "
+             "paying the ask to go long and the bid to go short."
+             if ticks else f", at the open of the first {args.bar}-minute bar after it.")
+          + "\nz is against the same pair and side at random moments within 5 days.")
+    print(f"\n{X.RULE_SENTENCE}")
+    _arms_table(summaries, horizons, ticks=ticks)
+    print("The null is drawn once per pair, from the pooled trades, and the two "
+          "halves share it.")
+
+    horizon = 15 if 15 in horizons else horizons[-1]
+    print(f"\nthe rule per pair and sample, at +{horizon}m: "
+          f"hit rate, mean, median and the two-sided sign test")
+    print(f"{'arm':<22}{'traded':>8}{'hit':>7}{'mean':>8}{'s.e.':>7}{'median':>8}{'p':>8}")
+    for summary, (pair, label) in zip(
+            summaries, [(p, s) for p in pairs
+                        for s in ("in-sample", "out-of-sample", "pooled")]):
+        values = [o.fwd_bps[horizon] for o in per_pair[pair]
+                  if label == "pooled" or sample_of(o.signal.code) == label]
+        wins = sum(1 for v in values if v > 0)
+        if not values:
+            print(f"{pair + ' ' + label:<22}{0:>8}" + "".join(f"{'-':>7}" for _ in range(2))
+                  + "".join(f"{'-':>8}" for _ in range(3)))
+            continue
+        print(f"{pair + ' ' + label:<22}{len(values):>8}{summary.hit.get(horizon, 0.0):>7.0%}"
+              f"{summary.fwd[horizon].mean:>+8.0f}{summary.fwd[horizon].se:>7.0f}"
+              f"{statistics.median(values):>+8.0f}"
+              f"{X.sign_test(wins, len(values)):>8.3f}")
+
+    # The variants, on the original pair, labelled as variants and never chosen.
+    variant_rows: list[tuple[str, S.ArmSummary, list[float]]] = []
+    if pairs:
+        pair = pairs[0]
+        print(f"\nvariants on {pair} -- reported, not chosen. The rule above is the rule; "
+              f"these\nare here so a reader can see whether it is one pick out of five.")
+        print(f"{'variant':<22}{'signals':>8}{'traded':>7}{'hit':>7}{'mean':>8}"
+              f"{'s.e.':>7}{'p':>8}")
+        for arm in X.VARIANTS:
+            arm_signals = X.signals(rows, pair, arm=arm)
+            arm_outcomes = S.measure(tapes, arm_signals, **graded)
+            arm_nulls = S.measure(
+                tapes, S.null_signals(tapes, arm_outcomes, per=args.null_per,
+                                      horizons=horizons, latency_s=args.latency,
+                                      workers=args.workers_io), **graded)
+            summary = S.summarize(f"{pair} {arm}", arm_signals, arm_outcomes, arm_nulls,
+                                  horizons=horizons, note="variant",
+                                  latency_s=args.latency if ticks else 0.0)
+            values = [o.fwd_bps[horizon] for o in arm_outcomes]
+            wins = sum(1 for v in values if v > 0)
+            variant_rows.append((arm, summary, values))
+            print(f"{arm:<22}{summary.signals:>8}{summary.measured:>7}"
+                  f"{summary.hit.get(horizon, 0.0):>7.0%}{summary.fwd[horizon].mean:>+8.0f}"
+                  f"{summary.fwd[horizon].se:>7.0f}{X.sign_test(wins, len(values)):>8.3f}")
+
+    if args.latency_sweep and not ticks:
+        print("\n--latency-sweep needs --tape dukascopy; 5-minute bars have one latency",
+              file=sys.stderr)
+    elif args.latency_sweep and pairs:
+        swept = X.signals(rows, pairs[0])
+        sweep_h = tuple(h for h in (15, 60) if h in horizons) or (horizons[-1],)
+        sweep = S.latency_sweep(tapes, swept, latencies=X.LATENCIES, horizons=sweep_h,
+                                per=args.null_per, workers=args.workers_io)
+        print(f"\nlatency sweep ({pairs[0]}, {len(swept)} signals, net of the half spread).")
+        print("Five minutes is the question: can somebody who reads the table by hand "
+              "still catch it?")
+        cols = "".join(f"{'+' + str(h) + 'm':>8}{'s.e.':>7}{'null':>8}{'z':>6}" for h in sweep_h)
+        print(f"{'entry':>8}{'traded':>8}{'rush':>7}{'sprd':>6}{cols}")
+        for row in sweep:
+            cells = "".join(
+                f"{row.fwd[h].mean:>+8.0f}{row.fwd[h].se:>7.0f}"
+                f"{row.null[h].mean:>+8.0f}{row.z[h]:>+6.1f}" for h in sweep_h)
+            print(f"{row.name:>8}{row.measured:>8}{row.rush.mean:>+7.0f}"
+                  f"{row.spread.mean:>6.1f}{cells}")
+
+    by_code: dict[str, dict[str, float]] = {}
+    for pair, outcomes in per_pair.items():
+        for outcome in outcomes:
+            date = outcome.signal.code.rsplit(":", 1)[-1]
+            by_code.setdefault(date, {})[pair] = outcome.fwd_bps.get(horizon, 0.0)
+    for row in rows:
+        row.outcomes = by_code.get(row.date, {})
+
+    print(f"\nper meeting: next year's median now and at the previous SEP, the rule's "
+          f"sign, and\neach pair's +{horizon}m in bps (blank where the tape could not "
+          f"answer).")
+    head = "".join(f"{p:>9}" for p in pairs)
+    print(f"{'meeting':>11}{'prev SEP':>11}{'year':>7}{'now':>7}{'was':>7}{'sign':>6}{head}")
+    for row in rows:
+        rule = row.rule
+        cells = "".join(
+            f"{row.outcomes[p]:>+9.0f}" if p in row.outcomes else f"{'-':>9}" for p in pairs)
+        if rule is None:
+            print(f"{X.pretty_date(row.date):>11}{X.pretty_date(row.previous_date):>11}"
+                  f"{'-':>7}{'-':>7}{'-':>7}{'-':>6}{cells}")
+            continue
+        print(f"{X.pretty_date(row.date):>11}{X.pretty_date(row.previous_date):>11}"
+              f"{rule.year:>7}{rule.now:>7.2f}{rule.previous:>7.2f}{rule.sign:>+6d}{cells}")
+
+    schedule = X.calendar(store)
+    ahead = X.next_projection_meetings(schedule, now)
+    print(f"\n{X.RULE_SENTENCE}")
+    if ahead:
+        print("The next projection meetings, from the FOMC calendar -- running this "
+              "command\nagain after each one is the forward test:")
+        for meeting in ahead:
+            print(f"    {meeting.date}")
+    else:
+        print("The calendar lists no projection meeting after today.")
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        stored: list[dict[str, Any]] = []
+        if out.exists():
+            try:
+                stored = json.loads(out.read_text()).get("meetings", [])
+            except (ValueError, OSError):
+                stored = []
+        payload = {
+            "mode": "dots", "rule": X.RULE, "variants": list(X.VARIANTS),
+            "rule_sentence": X.RULE_SENTENCE,
+            "since": since, "until": until, "tape": tape_name,
+            "latency_s": args.latency if ticks else None,
+            "horizons": list(horizons), "pairs": pairs,
+            "usd_side": X.USD_SIDE,
+            "first_printed_median": X.FIRST_PRINTED_MEDIAN,
+            "projections": len(projections),
+            "unreadable": [{"date": d, "why": w} for d, w in unreadable],
+            "printed_agreement": {"agreed": agreed, "compared": compared,
+                                  "meetings": with_printed, "notes": notes},
+            "arms": [
+                {"name": s.name, "signals": s.signals, "measured": s.measured,
+                 "note": s.note, "pre": asdict(s.pre), "spread": asdict(s.spread),
+                 "rush": asdict(s.rush),
+                 "fwd": {h: asdict(v) for h, v in s.fwd.items()},
+                 "fwd_mid": {h: asdict(v) for h, v in s.fwd_mid.items()},
+                 "null": {h: asdict(v) for h, v in s.null.items()},
+                 "hit": s.hit, "z": s.z}
+                for s in summaries
+            ],
+            "variant_arms": [
+                {"name": arm, "signals": s.signals, "measured": s.measured,
+                 "hit": s.hit, "fwd": {h: asdict(v) for h, v in s.fwd.items()},
+                 "sign_test": X.sign_test(sum(1 for v in values if v > 0), len(values))}
+                for arm, s, values in variant_rows
+            ],
+            "latency_sweep": [
+                {"latency_s": r.latency_s, "signals": r.signals, "measured": r.measured,
+                 "spread": asdict(r.spread), "rush": asdict(r.rush),
+                 "fwd": {h: asdict(v) for h, v in r.fwd.items()},
+                 "null": {h: asdict(v) for h, v in r.null.items()}, "z": r.z}
+                for r in sweep
+            ],
+            "next_projection_meetings": [m.date for m in ahead],
+            "meetings": X.merge_records(stored, [X.record_to_dict(r) for r in rows]),
+        }
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=1))
+        print(f"\nwrote {out} ({len(payload['meetings'])} meetings in the register)")
+    return 0
+
+
+def cmd_fx_presser(args: argparse.Namespace) -> int:
+    """Read the press conference that starts half an hour after the statement.
+
+    2022-11-02 is the case: the statement read one way and the press conference
+    the other, and the reader that had only the statement was short EURUSD 66 bp
+    into the wrong side of it. This mode gives the tree the statement, the dots
+    and the transcript split into the Chair's opening remarks and the Q&A, and
+    grades from the moment the Chair started speaking.
+
+    A transcript is published after the conference, so every arm here measures
+    whether the words were worth hearing and not whether they could have been
+    traded; a live speech-to-text feed is what would change that.
+    """
+    import concurrent.futures
+    import os
+    import statistics
+    import time
+    from pathlib import Path
+
+    from .fx import context as C
+    from .fx import documents as D
+    from .fx import dots as X
+    from .fx import presser as P
+    from .fx import reader as R
+    from .fx import study as S
+    from .fx.reader import Reader
+    from .listing.store import Store
+
+    store = Store(args.cache)
+    horizons = X.horizon_default(args.horizons)
+    # Both of these modes reach years back, where there are no 5-minute bars, so
+    # ticks are the default judge and ``--tape yahoo`` is the deliberate opt-out.
+    tape_name = args.tape or "dukascopy"
+    ticks = tape_name == "dukascopy"
+    now = time.time()
+    since = X.day_epoch(args.since) if args.since else X.day_epoch("2011-01-01")
+    until = X.day_epoch(args.until) + 86400 if args.until else now
+    if until <= since:
+        print("--until is not after --since", file=sys.stderr)
+        return 1
+    # The arms here are all on EURUSD, which is the pair the statement study and
+    # the dots rule were measured on; ``--pairs`` belongs to ``--dots``. Keeping
+    # one pair also keeps the statement reader's sign convention -- a hawkish
+    # dollar is short EURUSD -- exactly as the absolute tree wrote it.
+    pair = "EURUSD"
+
+    found = D.collect(store, since=since, until=until, issuers=("fed",),
+                      kinds=("monetary_policy",), limit=args.limit,
+                      workers=args.workers_io)
+    statements = S.statements(found.documents)
+    if not statements:
+        print("no FOMC statements in range", file=sys.stderr)
+        return 1
+    by_date = {X.eastern_date(d.ts): d for d in statements}
+    print(f"{len(statements)} FOMC statements, {statements[0].when:%Y-%m-%d} to "
+          f"{statements[-1].when:%Y-%m-%d}")
+
+    dates = P.presser_dates(store, since=since, until=until)
+    dates = [d for d in dates if d in by_date]
+    starts = {d: P.presser_start(by_date[d].ts) for d in dates}
+    per_year: dict[str, int] = {}
+    for date in dates:
+        per_year[date[:4]] = per_year.get(date[:4], 0) + 1
+    print(f"press conferences on the calendar: {len(dates)}"
+          + (f" ({', '.join(f'{y} {n}' for y, n in sorted(per_year.items()))})"
+             if per_year else ""))
+
+    # The dots sentences for the day, from the same reader the context mode
+    # uses, so the two modes cannot disagree about what the dots said.
+    def day_dots(date: str) -> tuple[str, list[str]]:
+        try:
+            parsed = C.dots(store, by_date[date].ts, local_date=date)
+        except Exception:  # noqa: BLE001 -- no projections is the common answer
+            return date, []
+        return date, list(parsed.sentences) if parsed is not None else []
+
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.workers_io)) as pool:
+        dots_by_date = dict(pool.map(day_dots, dates))
+
+    pressers, coverage = P.collect(store, dates, {d: by_date[d].ts for d in dates},
+                                   dots=dots_by_date, workers=args.workers_io)
+    if coverage.dark:
+        print(f"\npress-conference reader: DARK -- {coverage.dark}")
+        print("  the transcript arms are not run; the arms that need only the "
+              "start time still are")
+    else:
+        remarks = sorted(len(p.transcript.remarks) for p in pressers.values()) or [0]
+        qa = sorted(len(p.transcript.qa) for p in pressers.values()) or [0]
+        styles: dict[str, int] = {}
+        for presser in pressers.values():
+            styles[presser.transcript.style] = styles.get(presser.transcript.style, 0) + 1
+        print(f"transcripts read: {coverage.parsed}/{len(dates)}; median remarks "
+              f"{remarks[len(remarks) // 2]:,} chars, median Q&A {qa[len(qa) // 2]:,}; "
+              f"Q&A marked by " + ", ".join(f"{k} {v}" for k, v in sorted(styles.items())))
+
+    def make_reader(mode: str):
+        def factory() -> Reader:
+            if args.provider == "mock" or (
+                args.provider == "auto" and not os.environ.get("TYPESAFE_API_KEY")
+            ):
+                from .fx.mock import MockFxClient
+
+                return Reader(MockFxClient(), mode=mode)
+            return Reader(resolve_client(args.provider, timeout_s=20.0), mode=mode)
+        return factory
+
+    provider = make_reader(R.PRESSER)().client.provider
+    read_started = time.perf_counter()
+
+    def progress(tag: str):
+        def report(done: int, total: int, round_two: int, cost: float) -> None:
+            print(f"  {tag} {done}/{total}, {round_two} to round two, ${cost:.3f}, "
+                  f"{time.perf_counter() - read_started:.0f}s", file=sys.stderr, flush=True)
+        return report
+
+    # Only the statements that had a press conference are read; the rest are not
+    # part of this question and would cost a request each.
+    conference_days = [by_date[d] for d in dates]
+    absolute = S.read_all(
+        conference_days, make_reader(R.ABSOLUTE),
+        store=None if args.no_reading_cache else store,
+        cache_tag=f"{provider}:{R.TREE_VERSION}", workers=args.workers,
+        progress=progress("statement"), progress_every=25,
+    )
+    readings: list = []
+    if coverage.lit:
+        blocks = {by_date[d].id: pressers[d].state() for d in dates if d in pressers}
+        readable = [by_date[d] for d in dates if d in pressers]
+        readings = S.read_all(
+            readable, make_reader(R.PRESSER),
+            store=None if args.no_reading_cache else store,
+            cache_tag=f"{provider}:{R.PRESSER_VERSION}", pressers=blocks,
+            workers=args.workers, progress=progress("presser"), progress_every=25,
+        )
+        widths = sorted(r.questions_asked for r in readings) or [0]
+        walls = sorted(r.wall_ms for r in readings) or [0.0]
+        print(f"reader-presser ({provider}): {len(readings)} conferences, "
+              f"{sum(r.rounds == 2 for r in readings)} went to round two, "
+              f"{widths[len(widths) // 2]} questions in the median conference, "
+              f"median {statistics.median(walls):.0f} ms, "
+              f"${S.cost_usd(readings):.3f} of input tokens, "
+              f"{time.perf_counter() - read_started:.0f}s wall")
+
+    tapes = S.TickTapes(store, workers=args.workers_io) if ticks else S.Tape(
+        store, bar_min=args.bar, days=60)
+    graded = dict(horizons=horizons, workers=args.workers_io, latency_s=args.latency)
+    start_by_id = {by_date[d].id: starts[d] for d in dates}
+
+    # The dots rule, on the projection meetings among these days, entered when
+    # the Chair started rather than at the release: does the dots move continue?
+    # Every projection meeting since 2012 has had a press conference, so walking
+    # the conference days finds them all and ``records`` pairs consecutive ones
+    # without a gap to jump.
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.workers_io)) as pool:
+        projections = [p for p in pool.map(
+            lambda date: X.fetch_projection(store, date, ts=by_date[date].ts), dates)
+            if p is not None]
+    dots_rows = X.records(sorted(projections, key=lambda p: p.date))
+    dots_signals = []
+    for signal in X.signals(dots_rows, pair):
+        date = signal.code.rsplit(":", 1)[-1]
+        if date in starts:
+            dots_signals.append(replace(signal, ts=starts[date]))
+
+    arms: list[tuple[str, list[S.Signal], str]] = [
+        ("presser-reader",
+         P.reader_signals(readings, args.threshold, start_by_id, pair=pair),
+         "the pc1 tree on the transcript" if coverage.lit else "dark: no pypdf"),
+        ("statement-reader",
+         [replace(s, ts=start_by_id[s.code], pair=R.TICK_SYMBOLS.get(s.pair, s.pair))
+          for s in S.reader_signals(absolute, args.threshold)
+          if s.code in start_by_id],
+         "the v1 statement read, carried into the press conference"),
+        ("dots-rule", dots_signals, "the dots rule, entered when the Chair started"),
+        ("all pressers", P.keyword_signals(list(pressers.values()), pair=pair),
+         "keyword sign on the transcript" if coverage.lit else "dark: no pypdf"),
+    ]
+    summaries: list[S.ArmSummary] = []
+    per_arm: list[list[S.Outcome]] = []
+    for name, signals, note in arms:
+        outcomes = S.measure(tapes, signals, **graded)
+        nulls = S.measure(tapes, S.null_signals(tapes, outcomes, per=args.null_per,
+                                                horizons=horizons, latency_s=args.latency,
+                                                workers=args.workers_io), **graded)
+        summaries.append(S.summarize(name, signals, outcomes, nulls, horizons=horizons,
+                                     note=note, latency_s=args.latency if ticks else 0.0))
+        per_arm.append(outcomes)
+
+    print(f"\nSigned log return per signal, bps, on {pair}, entering on the first tick at "
+          f"or after\nthe press conference started + {args.latency:g}s. The start is "
+          f"the statement plus thirty\nminutes from 2013, and 2:15 p.m. ET in 2011 and "
+          f"2012; see ``presser_start``.")
+    _arms_table(summaries, horizons, ticks=ticks)
+
+    sweep: list[S.ArmSummary] = []
+    swept_arm, swept = (arms[0] if len(arms[0][1]) >= 5 else arms[1])[:2]
+    if args.latency_sweep and not ticks:
+        print("\n--latency-sweep needs --tape dukascopy; 5-minute bars have one latency",
+              file=sys.stderr)
+    elif args.latency_sweep and swept:
+        sweep_h = tuple(h for h in (15, 60) if h in horizons) or (horizons[-1],)
+        sweep = S.latency_sweep(tapes, swept, latencies=X.LATENCIES, horizons=sweep_h,
+                                per=args.null_per, workers=args.workers_io)
+        print(f"\nlatency sweep ({swept_arm}, {len(swept)} signals, net of the "
+              f"half spread):")
+        cols = "".join(f"{'+' + str(h) + 'm':>8}{'s.e.':>7}{'null':>8}{'z':>6}"
+                       for h in sweep_h)
+        print(f"{'entry':>8}{'traded':>8}{'rush':>7}{'sprd':>6}{cols}")
+        for row in sweep:
+            cells = "".join(
+                f"{row.fwd[h].mean:>+8.0f}{row.fwd[h].se:>7.0f}"
+                f"{row.null[h].mean:>+8.0f}{row.z[h]:>+6.1f}" for h in sweep_h)
+            print(f"{row.name:>8}{row.measured:>8}{row.rush.mean:>+7.0f}"
+                  f"{row.spread.mean:>6.1f}{cells}")
+
+    tape = tapes.get(pair) if ticks else None
+    flipped = P.reversals(readings, {r.document.id: pressers[X.eastern_date(r.document.ts)]
+                                     for r in readings
+                                     if X.eastern_date(r.document.ts) in pressers}, tape)
+    print(f"\nwhere the press conference did not say what the statement said "
+          f"({len(flipped)} of {len(readings)}):")
+    print(f"{'date':>12}{'remarks vs stmt':>18}{'Q&A vs remarks':>17}{'stance':>9}"
+          f"{'stmt->pc':>10}{'pc->+60m':>10}")
+    shown = max(args.show, 12)
+    for row in flipped[:shown]:
+        before = f"{row.statement_bps:+.0f}" if row.statement_bps is not None else "-"
+        after = f"{row.presser_bps:+.0f}" if row.presser_bps is not None else "-"
+        print(f"{X.pretty_date(row.date):>12}{row.remarks_vs_statement:>18}"
+              f"{row.qa_vs_remarks:>17}{row.presser_stance or '-':>9}{before:>10}{after:>10}")
+    if len(flipped) > shown:
+        print(f"  ... and {len(flipped) - shown} more; every one of them is in --out")
+
+    topics: dict[str, int] = {}
+    stances: dict[str, int] = {}
+    for reading in readings:
+        topics[reading.dominant_topic] = topics.get(reading.dominant_topic, 0) + 1
+        stances[reading.presser_stance] = stances.get(reading.presser_stance, 0) + 1
+    if readings:
+        print("\nwhat the conferences were about: " + ", ".join(
+            f"{k or 'none'} {v}" for k, v in sorted(topics.items(), key=lambda kv: -kv[1])))
+        print("how they read for the dollar: " + ", ".join(
+            f"{k or 'none'} {v}" for k, v in sorted(stances.items(), key=lambda kv: -kv[1])))
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        def outcome_row(o: S.Outcome) -> dict[str, Any]:
+            return {
+                "ts": o.signal.ts, "code": o.signal.code, "pair": o.signal.pair,
+                "side": o.signal.sign, "strength": o.signal.strength,
+                "pre_bps": o.pre_bps, "rush_bps": o.rush_bps,
+                "spread_bps": o.spread_bps, "latency_s": o.latency_s,
+                "fwd_bps": {h: o.fwd_bps.get(h) for h in horizons},
+                "fwd_mid_bps": {h: o.fwd_mid_bps.get(h) for h in horizons},
+            }
+
+        out.write_text(json.dumps({
+            "mode": "presser", "tree": R.PRESSER_VERSION, "provider": provider,
+            "since": since, "until": until, "tape": tape_name, "pair": pair,
+            "latency_s": args.latency if ticks else None,
+            "threshold": args.threshold, "horizons": list(horizons),
+            "dark": coverage.dark,
+            "conferences": len(dates), "transcripts": coverage.parsed,
+            "per_year": per_year,
+            "arms": [
+                {"name": s.name, "signals": s.signals, "measured": s.measured,
+                 "note": s.note, "pre": asdict(s.pre), "spread": asdict(s.spread),
+                 "rush": asdict(s.rush),
+                 "fwd": {h: asdict(v) for h, v in s.fwd.items()},
+                 "null": {h: asdict(v) for h, v in s.null.items()},
+                 "hit": s.hit, "z": s.z,
+                 "outcomes": [outcome_row(o) for o in outcomes]}
+                for s, outcomes in zip(summaries, per_arm)
+            ],
+            "latency_sweep": [
+                {"latency_s": r.latency_s, "signals": r.signals, "measured": r.measured,
+                 "fwd": {h: asdict(v) for h, v in r.fwd.items()},
+                 "null": {h: asdict(v) for h, v in r.null.items()}, "z": r.z}
+                for r in sweep
+            ],
+            "reversals": [asdict(row) for row in flipped],
+            "days": [
+                {
+                    "date": X.eastern_date(r.document.ts),
+                    "statement_ts": r.document.ts,
+                    "presser_ts": start_by_id.get(r.document.id),
+                    "remarks_chars": len(
+                        pressers[X.eastern_date(r.document.ts)].transcript.remarks)
+                    if X.eastern_date(r.document.ts) in pressers else 0,
+                    "qa_chars": len(pressers[X.eastern_date(r.document.ts)].transcript.qa)
+                    if X.eastern_date(r.document.ts) in pressers else 0,
+                    "qa_marker_style": pressers[X.eastern_date(r.document.ts)].transcript.style
+                    if X.eastern_date(r.document.ts) in pressers else "",
+                    "presser_reading": S.reading_to_dict(r),
+                }
+                for r in readings
+            ],
+        }, ensure_ascii=False, indent=1))
+        print(f"\nwrote {out}")
+    return 0
+
+
 def cmd_fx(args: argparse.Namespace) -> int:
     """Read central-bank text in one second; let the spot tape grade every arm."""
+    if args.dots:
+        return cmd_fx_dots(args)
+    if args.presser:
+        return cmd_fx_presser(args)
     if args.context:
         return cmd_fx_context(args)
     import os
@@ -999,7 +1603,8 @@ def cmd_fx(args: argparse.Namespace) -> int:
     issuers = tuple(i.strip().lower() for i in args.issuers.split(",") if i.strip())
     kinds = tuple(k.strip() for k in args.kinds.split(",") if k.strip()) if args.kinds else None
     horizons = tuple(int(h) for h in args.horizons.split(","))
-    ticks = args.tape == "dukascopy"
+    tape_name = args.tape or "yahoo"
+    ticks = tape_name == "dukascopy"
     now = time.time()
     # --since/--until are whole UTC days and win over --days; --until includes
     # the day it names, so "--until 2026-09-18" keeps that evening's speeches.
@@ -1227,7 +1832,7 @@ def cmd_fx(args: argparse.Namespace) -> int:
         out.write_text(json.dumps({
             "provider": provider, "tree": TREE_VERSION, "days": args.days,
             "since": since, "until": until,
-            "tape": args.tape, "latency_s": args.latency if ticks else None,
+            "tape": tape_name, "latency_s": args.latency if ticks else None,
             "issuers": issuers, "kinds": kinds, "threshold": args.threshold,
             "horizons": horizons, "bar_min": None if ticks else args.bar,
             "documents": len(documents), "skipped_no_time": found.skipped_no_time,
@@ -1379,8 +1984,9 @@ def build_parser() -> argparse.ArgumentParser:
     fx.add_argument("--days", type=float, default=60.0, help="how far back; 60 = Yahoo 5m depth")
     fx.add_argument("--since", default="", help="YYYY-MM-DD; overrides --days")
     fx.add_argument("--until", default="", help="YYYY-MM-DD, inclusive; overrides --days")
-    fx.add_argument("--tape", default="yahoo", choices=("yahoo", "dukascopy"),
-                    help="yahoo = 5m bars, 60 days deep; dukascopy = ticks, back to 2003")
+    fx.add_argument("--tape", default="", choices=("", "yahoo", "dukascopy"),
+                    help="yahoo = 5m bars, 60 days deep; dukascopy = ticks, back to 2003; "
+                         "the default is bars, or ticks for --dots and --presser")
     fx.add_argument("--latency", type=float, default=1.0,
                     help="seconds between the timestamp and the entry tick (dukascopy only)")
     fx.add_argument("--latency-sweep", action="store_true",
@@ -1400,6 +2006,12 @@ def build_parser() -> argparse.ArgumentParser:
     fx.add_argument("--workers-io", type=int, default=8, help="parallel fetches")
     fx.add_argument("--null-per", type=int, default=2, help="random controls per measured signal")
     fx.add_argument("--show", type=int, default=8, help="disagreements to print")
+    fx.add_argument("--dots", action="store_true",
+                    help="validate the dot-plot rule out of sample and forward; no model")
+    fx.add_argument("--presser", action="store_true",
+                    help="read the press conference that starts 30 minutes after the statement")
+    fx.add_argument("--pairs", default="EURUSD,USDJPY,GBPUSD",
+                    help="--dots only: the pairs to grade the rule on")
     fx.add_argument("--context", action="store_true",
                     help="FOMC statements only, read against the pre-release context "
                          "(implies --issuers fed)")
