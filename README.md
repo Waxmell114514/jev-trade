@@ -1346,7 +1346,83 @@ records go into the `--out` JSON keyed by date, and a later run merges into that
 file rather than recomputing it, so running the same command after each of those
 dates *is* the forward test and the file accumulates it.
 
-The run has not been done yet; the numbers will go here when it has.
+#### The run (no model, 58 projection meetings, three pairs, ticks)
+
+Run on 2026-09-20 with `--since 2012-01-01 --pairs EURUSD,USDJPY,GBPUSD
+--latency-sweep`. 59 projection tables parsed, 15 from the histogram years and
+44 with a printed median; the two 2011 pages carry no funds-rate histogram at
+all. **Histogram against printed median: 198 of 199 year-cells agree** over the
+44 meetings that have both (the one miss is 2026-09-16's longer-run dot, which
+the page rounds to 3.2 and the histogram puts at exactly 3.25). Of 58 meetings
+the rule signs 37; the other 21 printed no change in next year's median, twelve
+of them at the zero bound in 2012–2013 and 2020–2021.
+
+```
+arm                    signals traded    pre   rush  sprd      +1m      +5m     +15m     +30m     +60m  hit15    z15
+EURUSD in-sample            31     31     +2     +3   1.8       +8      +14      +19      +18      +14    77%   +3.4
+EURUSD out-of-sample         6      6     +2     +7   2.2      +12      +13      +29      +25      +21    83%   +3.1
+EURUSD pooled               37     37     +2     +3   1.9       +9      +14      +20      +19      +15    78%   +4.2
+  s.e.                                                         +-4      +-4      +-5      +-5      +-8
+USDJPY pooled               37     36     -1     +5   3.0       +8      +12      +22      +21      +14    78%   +5.0
+  s.e.                                                         +-4      +-4      +-4      +-5      +-8
+GBPUSD pooled               37     36     +0     +3   3.7       +7      +12      +18      +18      +14    75%   +4.2
+  s.e.                                                         +-3      +-4      +-4      +-5      +-7
+
+at +15m: hit, mean, s.e., median, two-sided sign test
+EURUSD in-sample     31   77%   +19   6   +26   0.003     USDJPY in-sample   30   80%   +21   5   +21   0.001
+EURUSD out-of-sample  6   83%   +29   9   +32   0.219     GBPUSD in-sample   30   73%   +17   5   +21   0.016
+EURUSD pooled        37   78%   +20   5   +29   0.001     USDJPY pooled      36   78%   +22   4   +23   0.001
+                                                          GBPUSD pooled      36   75%   +18   4   +22   0.004
+
+variants on EURUSD, reported and not chosen:
+current-year   20   90%   +28   6   p 0.000      two-years-out   43   70%   +16   5   p 0.014
+longer-run     21   57%    +6   7   p 0.664      sum-of-years    47   68%   +15   5   p 0.019
+
+latency sweep, EURUSD, 37 signals, net of the half spread:
+   entry   rush  sprd    +15m   s.e.     z    +60m   s.e.     z
+      0s     +0   2.4     +23      5  +4.8     +18      8  +2.2
+      1s     +3   1.9     +20      5  +4.2     +15      8  +1.8
+      5s     +9   1.9     +15      4  +3.4      +9      7  +1.1
+     30s     +9   0.7     +16      3  +4.4      +9      6  +1.4
+    120s    +16   0.4      +8      3  +2.2      +4      6  +0.6
+    300s    +18   0.4      +6      3  +1.7      +2      6  +0.3
+```
+
+What the validation says, and what it cannot:
+
+- **The out-of-sample half agrees and is too small to prove anything.** Six
+  signed meetings in 2014–2015 (the other nine printed no change, because next
+  year's median sat at 0.25 through the zero bound), five of six right, +29 ± 9
+  bp. The sign test on six is p = 0.22. It does not contradict the in-sample
+  number; it cannot confirm it either. The pooled 37 is the honest headline:
+  **+20 ± 5 bp at fifteen minutes, 29 of 37 right, p = 0.001.**
+- **The other two pairs agree, and they are one factor.** USDJPY 78% and
+  GBPUSD 75% over 36 each, both p ≤ 0.004. That is the dollar moving, seen
+  three times, not three independent tests; what it rules out is a EURUSD-only
+  artefact.
+- **The rule is not one pick out of five.** Current-year's median does better
+  (90% over 20), two-years-out and the sum do worse but hold (70%, 68%), the
+  longer-run dot does nothing (57%, p = 0.66). The finding is "the near dots
+  moved", and it degrades gracefully away from that.
+- **A person can catch it.** Entering thirty seconds after the release, time
+  to read a table by hand, still returns +16 ± 3 at fifteen minutes; two
+  minutes late, +8 ± 3; five minutes late, +6 ± 3 with the rush column at +18,
+  meaning most of the move has gone by. So this is a number that a machine
+  reads in a second and a desk reads in half a minute, and the market takes a
+  quarter of an hour to finish pricing. It is, once more, not a reading job.
+- **The misses are informative.** Eight of 37 on EURUSD: 2018-12-19 (dots
+  down, "autopilot" press conference, dollar up), 2023-03-22 (the SVB meeting),
+  2021-09-22 (first hike pulled into 2022, dollar down), 2019-09-18, 2018-03-21,
+  2025-06-18, 2024-03-20, 2014-06-18. The days the rule lost are the days the
+  press conference or the moment mattered more than the table.
+
+**The forward register.** The rule, the 58 records and the sign convention are
+in `runs/fx-dots-2012-2026.json`; the next projection meetings on the FOMC
+calendar are **2026-12-09**, 2027-03-17, 2027-06-09, 2027-09-15 and 2027-12-08.
+Running the same command after each is the forward test, and the first check is
+scheduled for the morning after 2026-12-09. A forward tally will be appended
+here, one row per meeting, with no other change to the rule.
+
 
 ### The press conference, thirty minutes later
 
@@ -1559,7 +1635,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 394 tests
+python -m pytest -q      # 396 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
