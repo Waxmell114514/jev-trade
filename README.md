@@ -1456,7 +1456,61 @@ release to the Chair's first word and from there to an hour later, side by side.
 That is the shape of 2022-11-02, and a table is the only way to find out whether
 that day was one of a kind or one of twenty.
 
-The run has not been done yet; the numbers will go here when it has.
+#### The run (real model, 95 press conferences, ticks)
+
+Run on 2026-09-20. All 95 transcripts since April 2011 fetched and split
+(median remarks 7,698 characters, median Q&A 41,308, of which the reader saw
+the first 9,000); 85 went to round two, 33 questions in the median conference,
+**median 1,029 ms per conference, $0.056** for the lot, plus $0.024 for the 95
+statement readings this mode asked again. Entry on
+the first EURUSD tick after the Chair's first word plus one second.
+
+```
+arm                    signals traded    pre   rush  sprd      +1m      +5m     +15m     +30m     +60m  hit15    z15
+presser-reader              24     24     +4     +0   0.4       +1       -1       -3       -3       -3    42%   -0.6
+  s.e.                                                         +-1      +-2      +-5      +-6      +-8
+statement-reader            52     52     +1     +0   0.4       +0       +2      -11      -11       -9    31%   -3.5
+  s.e.                                                         +-1      +-2      +-3      +-4      +-5
+dots-rule                   37     37     -1     +0   0.3       +1       +1       -5       -4       -1    41%   -0.8
+  s.e.                                                         +-1      +-2      +-4      +-5      +-6
+all pressers                95     95     +1     +0   0.4       -0       -0       -7       -8       -9    38%   -2.8
+  s.e.                                                         +-0      +-1      +-2      +-3      +-3
+
+how they read for the dollar: dovish 52, hawkish 38, neutral 5
+what they were about: path of rates 48, inflation 21, balance sheet 8, financial conditions 6
+where the conference did not say what the statement said: 12 of 95
+```
+
+- **The reader read the press conference and got nothing from it.** 24 trades,
+  −3 ± 5 bp at fifteen minutes, ten of twenty-four right, flat at every latency
+  from zero to five minutes. A transcript is the slowest possible feed for a
+  spoken event, and the reader saw the first fifth of the Q&A; both are
+  reasons, neither is an excuse. The number is nothing.
+- **Holding the statement's read into the conference loses, and loses more
+  than chance.** The absolute reading of the day's statement, carried from
+  14:30, comes out at **−11 ± 3 bp at fifteen minutes, 16 of 52 right** (sign
+  test p = 0.008), −11 ± 4 at thirty, −9 ± 5 at sixty. Split by era it is
+  −3 (47%) over the quarterly conferences of 2011–2018 and **−15 (21%) over the
+  every-meeting conferences since 2019**. The keyword bot on the transcript
+  itself loses too: −7 ± 2 at fifteen minutes (p = 0.02), −9 ± 3 at sixty
+  (p = 0.007), in both eras. The dots move from the release does not continue
+  through the conference either (−5 ± 4). Whatever the text of the day says,
+  the hour after the Chair starts talking tends to go the other way. Fading
+  the statement's read at 14:30 would have made +11 bp at fifteen minutes on
+  these 52 days; that is the mirror of one arm on one pair, reported here as a
+  pattern registered for the forward test and not as a trade.
+- **The reversal table is short.** Twelve days of ninety-five where the reader
+  said the remarks or the Q&A did not say what the statement said, 2024-12-18
+  among them (statement to Chair −69 bp, Chair to an hour later −57). Nine of
+  the twelve are from 2021 on. 2022-11-02 is not in it: the reader called that
+  conference consistent with its statement, which is the day the mode was
+  built for, and it missed it.
+
+For the question that started this section: the words of the press conference
+are not where the direction is. The direction is in the reversal of whatever
+the statement's words said — a pattern, not a reading — and the thing a reader
+can still do here is what it did on the statements: read the facts right and
+abstain.
 
 ### What this does not show
 
