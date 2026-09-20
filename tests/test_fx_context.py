@@ -194,14 +194,20 @@ def test_pricing_sentences_say_so_at_the_zero_bound():
 
 
 def test_a_parsed_target_the_effective_rate_contradicts_is_refused():
-    """``announced_rate`` reads "at 0 to 1/4 percent" as 1.00; the funds rate says no."""
-    zirp = doc(body="the Committee decided to keep its target range for the federal "
-                    "funds rate at 0 to 1/4 percent.", ts=FOMC_JUL_TS)
+    """The zero-bound range parses as 0.25 now; a target the funds rate contradicts is refused."""
     from jevtrade.fx.baseline import announced_rate
 
-    assert announced_rate(f"{zirp.title}\n{zirp.body}") == 1.0
+    zirp = doc(body="the Committee decided to keep its target range for the federal "
+                    "funds rate at 0 to 1/4 percent.", ts=FOMC_JUL_TS)
+    assert announced_rate(f"{zirp.title}\n{zirp.body}") == 0.25
     rates = C.Rates(as_of="2009-03-17", ts=0.0, values={"ff": 0.20, "6m": 0.45})
     lines = C.pricing_sentences(rates, previous_statement=zirp)
+    assert "could not be parsed" not in lines[0]
+
+    wrong = doc(body="the Committee decided to keep its target range for the federal "
+                     "funds rate at 4 to 4-1/4 percent.", ts=FOMC_JUL_TS)
+    assert announced_rate(f"{wrong.title}\n{wrong.body}") == 4.25
+    lines = C.pricing_sentences(rates, previous_statement=wrong)
     assert "could not be parsed" in lines[0] and "0.20 percent" in lines[0]
 
 

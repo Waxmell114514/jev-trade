@@ -66,6 +66,10 @@ def _value(text: str) -> float | None:
     if match:
         whole, num, den = (int(g) for g in match.groups())
         return whole + num / den if den else float(whole)
+    match = re.fullmatch(r"\s*(\d+)/(\d+)\s*", text)  # a bare "1/4", as in "0 to 1/4 percent"
+    if match:
+        num, den = (int(g) for g in match.groups())
+        return num / den if den else None
     match = re.search(r"-?\d+(?:\.\d+)?", text)
     return float(match.group(0)) if match else None
 

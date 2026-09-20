@@ -839,3 +839,12 @@ def test_calendar_match_prefers_the_rate_row_over_the_votes_row():
 def test_is_percent_tells_rates_from_votes():
     assert B._is_percent("4.00%") and B._is_percent("<1.25%")
     assert not B._is_percent("3-0-6") and not B._is_percent("") and not B._is_percent(None)
+
+
+def test_announced_rate_reads_the_zero_bound_range():
+    zlb = ("Federal Reserve issues FOMC statement\nThe Committee decided to keep the target range "
+           "for the federal funds rate at 0 to 1/4 percent.")
+    assert B.announced_rate(zlb) == 0.25
+    assert B._range_top("1/4 to 1/2") == 0.5
+    assert B._range_top("0 to 1/4") == 0.25
+    assert B._value("1/4") == 0.25 and B._value("3-3/4") == 3.75 and B._value("4.00%") == 4.0
