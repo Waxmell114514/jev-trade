@@ -15,6 +15,16 @@ trader be on", and "would a trader long this currency be unaffected" -- because
 two rephrasings of one question make partly independent errors, and that is the
 cheapest redundancy available. No second round, no trade.
 
+There are two modes. The **absolute** one is the tree above: read the text, say
+which way it leans. The **context** one adds the question the absolute tree
+cannot ask -- *more hawkish than what?* -- because it is handed the pre-release
+context ``fx/context.py`` assembles and asks for the stance **relative** to it:
+what the market expected, what the statement did, and which way the difference
+cuts. The sign of a context signal comes from ``relative_stance`` and never from
+``stance``: on 2024-12-18 the statement was a cut and read dovish, and the
+market took it as hawkish, which is a disagreement the absolute tree has no
+vocabulary for.
+
 Sign convention, stated once and tested: **hawkish for the issuer's own currency
 means that currency strengthens.** Which way that pushes the *pair* depends on
 which side of the pair the currency is quoted, which is what ``PAIRS`` is for; a
@@ -31,6 +41,17 @@ from ..types import JevResponse
 from .documents import Document, local_string
 
 TREE_VERSION = "v1"
+# The context tree is a different set of questions over a different state, so it
+# gets its own cache tag and the absolute reader's ``v1`` answers stay reusable.
+CONTEXT_VERSION = "ctx1"
+ABSOLUTE, CONTEXT = "absolute", "context"
+MODES = (ABSOLUTE, CONTEXT)
+TREE_VERSIONS = {ABSOLUTE: TREE_VERSION, CONTEXT: CONTEXT_VERSION}
+
+
+def tree_version(mode: str = ABSOLUTE) -> str:
+    return TREE_VERSIONS.get(mode, TREE_VERSION)
+
 
 KIND = "kind"
 POLICY_RELEVANT = "policy_relevant"
@@ -40,6 +61,12 @@ MAGNITUDE = "magnitude"
 GUIDANCE_CHANGED = "guidance_changed"
 SURPRISE = "surprise"
 INTERVENTION_TIER = "intervention_tier"
+EXPECTED_ACTION = "expected_action"
+ACTUAL_ACTION = "actual_action"
+RELATIVE_STANCE = "relative_stance"
+SURPRISE_CHANNEL = "surprise_channel"
+SURPRISE_SIZE = "surprise_size"
+VERSUS_MINUTES = "versus_minutes"
 HOLDER_UNAFFECTED = "holder_unaffected"
 STANCE_REVERSED = "stance_reversed"
 HORIZON = "horizon"
@@ -60,6 +87,41 @@ KINDS = (
 HAWKISH, DOVISH, NEUTRAL = "hawkish", "dovish", "neutral"
 BUY, SELL, NEITHER = "buy_the_currency", "sell_the_currency", "neither"
 MINUTES_H, HOURS_H, DAYS_H = "minutes", "hours", "days_or_more"
+
+HIKE, HOLD, CUT = "hike", "hold", "cut"
+ACTIONS = (HIKE, HOLD, CUT)
+# How far up the ladder an action sits, so "more hawkish than expected" is a
+# comparison code can make and not a judgment the model has to repeat.
+ACTION_RANK = {CUT: -1, HOLD: 0, HIKE: +1}
+
+MORE_HAWKISH = "more_hawkish_than_expected"
+IN_LINE = "in_line_with_expectations"
+MORE_DOVISH = "more_dovish_than_expected"
+RELATIVE_OPTIONS = (MORE_HAWKISH, IN_LINE, MORE_DOVISH)
+# The relative call is what a context signal is signed by. In-line is flat.
+RELATIVE_STANCES = {MORE_HAWKISH: HAWKISH, MORE_DOVISH: DOVISH, IN_LINE: NEUTRAL}
+
+RATE_CHANNEL = "rate_decision"
+GUIDANCE_CHANNEL = "forward_guidance"
+BALANCE_SHEET_CHANNEL = "balance_sheet"
+DOTS_CHANNEL = "projections_or_dots"
+VOTE_CHANNEL = "vote_or_dissent"
+ASSESSMENT_CHANNEL = "economic_assessment"
+NO_CHANNEL = "nothing_surprising"
+CHANNELS = (
+    RATE_CHANNEL, GUIDANCE_CHANNEL, BALANCE_SHEET_CHANNEL, DOTS_CHANNEL,
+    VOTE_CHANNEL, ASSESSMENT_CHANNEL, NO_CHANNEL,
+)
+
+VS_MORE_HAWKISH, VS_CONSISTENT, VS_MORE_DOVISH = "more_hawkish", "consistent", "more_dovish"
+VERSUS_OPTIONS = (VS_MORE_HAWKISH, VS_CONSISTENT, VS_MORE_DOVISH)
+
+SURPRISE_LEVELS = (
+    "nothing the market did not already have",
+    "a nuance desks will argue about",
+    "a clear surprise traders reposition on",
+    "the kind of surprise that sets the day",
+)
 
 MAGNITUDE_LEVELS = (
     "no effect on the exchange rate",
@@ -128,8 +190,108 @@ def _noul(instructions: str, yes: str, no: str) -> dict[str, Any]:
 # ------------------------------------------------------------------ round one
 
 
+def context_questions(currency: str) -> dict[str, dict[str, Any]]:
+    """The six relative questions: expected, actual, and the gap between them.
+
+    Every one of these is answered *against the context block in the state* and
+    is meaningless without it. ``expected_action`` and ``actual_action`` are
+    asked separately, and separately from ``relative_stance``, because code can
+    check the second against the rate it parsed out of the statement -- which
+    turns "the model cannot read" and "the model read the market wrong" into two
+    different findings instead of one shrug.
+    """
+    money = currency or "the issuing central bank's currency"
+    return {
+        EXPECTED_ACTION: {
+            "type": "choice",
+            "instructions": (
+                "Read only the context block, not the statement. What did the market "
+                "expect this meeting to do with the policy rate?"
+            ),
+            "criteria": {
+                HIKE: "Raise the target range at this meeting.",
+                HOLD: "Leave the target range where it is at this meeting.",
+                CUT: "Lower the target range at this meeting.",
+            },
+        },
+        ACTUAL_ACTION: {
+            "type": "choice",
+            "instructions": "What did this statement actually do with the policy rate?",
+            "criteria": {
+                HIKE: "It raised the target range.",
+                HOLD: "It left the target range unchanged.",
+                CUT: "It lowered the target range.",
+            },
+        },
+        RELATIVE_STANCE: {
+            "type": "choice",
+            "instructions": (
+                f"Against the context -- what was priced, what the projections did, what "
+                f"the last statement and the minutes said, what officials said between the "
+                f"meetings -- is this statement more hawkish or more dovish than that "
+                f"context implies, for {money}? Judge the statement relative to the "
+                "expectation, not on its own."
+            ),
+            "criteria": {
+                MORE_HAWKISH: (
+                    f"Tighter than the context implies: a reader holding those "
+                    f"expectations has to revise towards higher rates. Supportive of {money}."
+                ),
+                IN_LINE: "It is what that context implies. Nothing to revise.",
+                MORE_DOVISH: (
+                    f"Easier than the context implies: a reader holding those "
+                    f"expectations has to revise towards lower rates. A weight on {money}."
+                ),
+            },
+        },
+        SURPRISE_CHANNEL: {
+            "type": "choice",
+            "instructions": "Where does the difference from the context sit, if anywhere?",
+            "criteria": {
+                RATE_CHANNEL: "The rate decision itself was not the one the context implied.",
+                GUIDANCE_CHANNEL: (
+                    "What the Committee says it will do next, or what it says it is "
+                    "waiting for, moved."
+                ),
+                BALANCE_SHEET_CHANNEL: (
+                    "The balance sheet: purchases, runoff, reinvestment, holdings."
+                ),
+                DOTS_CHANNEL: (
+                    "The projections released with the statement: the median path, the "
+                    "dots, the forecasts."
+                ),
+                VOTE_CHANNEL: "The vote: a dissent, a new dissenter, a unanimity that broke.",
+                ASSESSMENT_CHANNEL: (
+                    "The description of the economy: growth, the labour market, inflation, "
+                    "the balance of risks."
+                ),
+                NO_CHANNEL: "Nothing here differs from what the context implied.",
+            },
+        },
+        SURPRISE_SIZE: {
+            "type": "score",
+            "instructions": (
+                "How big is the gap between this statement and what the context implied?"
+            ),
+            "criteria": list(SURPRISE_LEVELS),
+        },
+        VERSUS_MINUTES: {
+            "type": "choice",
+            "instructions": (
+                "Set the statement against the minutes and the intermeeting speeches in "
+                "the context. Which way has the Committee moved since it was last heard?"
+            ),
+            "criteria": {
+                VS_MORE_HAWKISH: "The statement is firmer than the minutes and the speeches were.",
+                VS_CONSISTENT: "It says what those already said.",
+                VS_MORE_DOVISH: "The statement is softer than the minutes and the speeches were.",
+            },
+        },
+    }
+
+
 def round_one_questions(
-    currency: str, changes: Sequence[tuple[str, str]]
+    currency: str, changes: Sequence[tuple[str, str]], *, mode: str = ABSOLUTE
 ) -> dict[str, dict[str, Any]]:
     money = currency or "the issuing central bank's currency"
     questions: dict[str, dict[str, Any]] = {
@@ -234,11 +396,46 @@ def round_one_questions(
             "A reader would update what they expect the bank to do.",
             "It is a rephrasing, a date, a number that had to change anyway, or housekeeping.",
         )
+    if mode == CONTEXT:
+        # Width is free, so the context mode carries the whole absolute tree and
+        # adds to it; the two readings are then comparable question by question.
+        questions.update(context_questions(currency))
     return questions
 
 
-def round_two_questions(currency: str) -> dict[str, dict[str, Any]]:
+def round_two_questions(currency: str, *, mode: str = ABSOLUTE) -> dict[str, dict[str, Any]]:
     money = currency or "this currency"
+    if mode == CONTEXT:
+        return {
+            HOLDER_UNAFFECTED: _noul(
+                f"Would a trader who is long {money} and had already read the context "
+                "have no reason to change their position after this statement?",
+                f"The context already had it; nothing here changes the case for holding {money}.",
+                f"A {money} holder who had read the context would want to act on this.",
+            ),
+            STANCE_REVERSED: {
+                "type": "choice",
+                "instructions": (
+                    f"Forget the question of tone. A desk that had read this context and "
+                    f"then read this statement: which side of {money} for the next hour?"
+                ),
+                "criteria": {
+                    BUY: f"Buy {money}: the statement is tighter than the desk was positioned for.",
+                    SELL: (f"Sell {money}: the statement is easier than the desk "
+                           "was positioned for."),
+                    NEITHER: "Neither side: the desk had this already.",
+                },
+            },
+            HORIZON: {
+                "type": "choice",
+                "instructions": "Over what horizon would this text move the exchange rate?",
+                "criteria": {
+                    MINUTES_H: "Minutes: it is priced almost at once and then done.",
+                    HOURS_H: "Hours: it takes a session to be read and absorbed.",
+                    DAYS_H: "Days or more: it changes the path, not the level.",
+                },
+            },
+        }
     return {
         HOLDER_UNAFFECTED: _noul(
             f"Would a trader who is long {money} have no reason to change their "
@@ -279,6 +476,7 @@ def build_state(
     previous: Document | None = None,
     calendar: dict[str, Any] | None = None,
     so_far: dict[str, Any] | None = None,
+    context: str = "",
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "issuer": document.issuer.upper(),
@@ -307,6 +505,11 @@ def build_state(
             "forecast": calendar.get("forecast", ""),
             "previous": calendar.get("previous", ""),
         }
+    if context:
+        # Everything the market already had, assembled by ``fx/context.py`` and
+        # asserted there to predate the release. It goes in as one block of
+        # prose because that is what it is: sentences, not features.
+        state["context_before_the_release"] = context
     if so_far:
         state["first_round_verdicts"] = so_far
     return state
@@ -333,6 +536,21 @@ def strength(
     value = p_stance * confirm * magnitude * relevant
     value *= 0.7 + 0.3 * surprise
     value *= 1.0 - 0.5 * priced_in
+    return max(0.0, min(1.0, value))
+
+
+def context_strength(
+    p_relative: float, confirm: float, surprise: float, priced_in: float
+) -> float:
+    """Arithmetic on four probabilities; the model multiplies nothing.
+
+    The absolute tree's ``strength`` dampens a fully-priced-in reading by half,
+    because restating a known position at a moment of doubt is itself news. The
+    context tree does not: the whole point of handing the reader the
+    expectation is that "the market already had this" is a complete answer, and
+    a statement that adds nothing to the context should not be traded at all.
+    """
+    value = p_relative * confirm * surprise * (1.0 - priced_in)
     return max(0.0, min(1.0, value))
 
 
@@ -382,6 +600,19 @@ class Reading:
     wall_ms: float
     input_tokens: int
     questions_asked: int = 0
+    # Context mode only; empty strings and zeros on an absolute reading.
+    mode: str = ABSOLUTE
+    expected_action: str = ""
+    p_expected: float = 0.0
+    actual_action: str = ""
+    p_actual: float = 0.0
+    relative: str = ""
+    p_relative: float = 0.0
+    surprise_channel: str = ""
+    p_channel: float = 0.0
+    surprise_size: float = 0.0
+    versus_minutes: str = ""
+    context_chars: int = 0
     responses: list[JevResponse] = field(default_factory=list, repr=False)
 
     @property
@@ -409,6 +640,8 @@ class Reader:
         stance_floor: float = 0.5,
         material_floor: float = 0.5,
         intervention_floor: float = 0.6,
+        surprise_floor: float = 0.6,
+        mode: str = ABSOLUTE,
     ) -> None:
         self.client = client
         self.body_chars = body_chars
@@ -416,6 +649,10 @@ class Reader:
         self.stance_floor = stance_floor
         self.material_floor = material_floor
         self.intervention_floor = intervention_floor
+        # Context mode only: how surprising round one has to find a statement
+        # for round two to be worth a request on its own.
+        self.surprise_floor = surprise_floor
+        self.mode = mode if mode in MODES else ABSOLUTE
 
     def _ask(self, questions: dict[str, Any], state: dict[str, Any]) -> JevResponse:
         self.client.questions = questions
@@ -428,17 +665,18 @@ class Reader:
         previous: Document | None = None,
         changes: Sequence[tuple[str, str]] = (),
         calendar: dict[str, Any] | None = None,
+        context: str = "",
     ) -> Reading:
         started = time.perf_counter()
         changes = list(changes)[: self.max_diffs]
         currency = document.currency
 
-        questions = round_one_questions(currency, changes)
+        questions = round_one_questions(currency, changes, mode=self.mode)
         first = self._ask(
             questions,
             build_state(
                 document, changes, round_no=1, body_chars=self.body_chars,
-                previous=previous, calendar=calendar,
+                previous=previous, calendar=calendar, context=context,
             ),
         )
         kind = first.choice(KIND)
@@ -465,9 +703,36 @@ class Reader:
         responses = [first]
         asked = len(questions)
 
-        decisive = stance.choice != NEUTRAL and stance.p(stance.choice) >= self.stance_floor
-        material = any(d.material >= self.material_floor for d in diffs)
-        loud = intervention >= self.intervention_floor
+        # The context answers, or blanks when this is the absolute tree.
+        expected = actual = relative = channel = versus = ""
+        p_expected = p_actual = p_relative = p_channel = surprise_size = 0.0
+        relative_confidence = 0.0
+        if self.mode == CONTEXT:
+            expected_answer = first.choice(EXPECTED_ACTION)
+            actual_answer = first.choice(ACTUAL_ACTION)
+            relative_answer = first.choice(RELATIVE_STANCE)
+            channel_answer = first.choice(SURPRISE_CHANNEL)
+            expected = expected_answer.choice
+            p_expected = expected_answer.p(expected)
+            actual = actual_answer.choice
+            p_actual = actual_answer.p(actual)
+            relative = relative_answer.choice
+            p_relative = relative_answer.p(relative)
+            relative_confidence = relative_answer.confidence
+            channel = channel_answer.choice
+            p_channel = channel_answer.p(channel)
+            surprise_size = first.score(SURPRISE_SIZE).normalized
+            versus = first.choice(VERSUS_MINUTES).choice
+            # The relative call is the whole point, so it alone opens round two
+            # -- with the size as a second door, because a statement the model
+            # calls in-line but enormous is exactly the case worth a re-ask.
+            decisive = relative != IN_LINE and p_relative >= self.stance_floor
+            material = surprise_size >= self.surprise_floor
+            loud = False
+        else:
+            decisive = stance.choice != NEUTRAL and stance.p(stance.choice) >= self.stance_floor
+            material = any(d.material >= self.material_floor for d in diffs)
+            loud = intervention >= self.intervention_floor
         confirm = 0.0
         horizon = ""
         if decisive or material or loud:
@@ -480,37 +745,59 @@ class Reader:
                 ),
                 "intervention_tier": round(intervention, 3),
             }
-            second_questions = round_two_questions(currency)
+            if self.mode == CONTEXT:
+                so_far.update({
+                    "expected_action": expected, "actual_action": actual,
+                    "relative_stance": relative, "surprise_channel": channel,
+                    "surprise_size": round(surprise_size, 3),
+                })
+            second_questions = round_two_questions(currency, mode=self.mode)
             second = self._ask(
                 second_questions,
                 build_state(
                     document, changes, round_no=2, body_chars=self.body_chars,
-                    previous=previous, calendar=calendar, so_far=so_far,
+                    previous=previous, calendar=calendar, so_far=so_far, context=context,
                 ),
             )
             responses.append(second)
             asked += len(second_questions)
             side = second.choice(STANCE_REVERSED)
-            want = {HAWKISH: BUY, DOVISH: SELL}.get(stance.choice)
+            lean = (RELATIVE_STANCES.get(relative, NEUTRAL) if self.mode == CONTEXT
+                    else stance.choice)
+            want = {HAWKISH: BUY, DOVISH: SELL}.get(lean)
             agree = side.p(want) if want else 0.0
             confirm = (1.0 - second.noul(HOLDER_UNAFFECTED).noul) * agree
             horizon = second.choice(HORIZON).choice
 
         verdict: Verdict | None = None
-        signed = signed_pair(currency, stance.choice)
-        if signed is not None:
-            symbol, sign = signed
-            p_side = stance.p(stance.choice)
-            verdict = Verdict(
-                pair=symbol,
-                sign=sign,
-                p_side=p_side,
-                confidence=stance.confidence,
-                strength=strength(
-                    p_side, confirm, magnitude, relevant, surprise,
-                    1.0 - new_information,
-                ),
-            )
+        if self.mode == CONTEXT:
+            signed = signed_pair(currency, RELATIVE_STANCES.get(relative, NEUTRAL))
+            if signed is not None:
+                symbol, sign = signed
+                verdict = Verdict(
+                    pair=symbol,
+                    sign=sign,
+                    p_side=p_relative,
+                    confidence=relative_confidence,
+                    strength=context_strength(
+                        p_relative, confirm, surprise_size, 1.0 - new_information,
+                    ),
+                )
+        else:
+            signed = signed_pair(currency, stance.choice)
+            if signed is not None:
+                symbol, sign = signed
+                p_side = stance.p(stance.choice)
+                verdict = Verdict(
+                    pair=symbol,
+                    sign=sign,
+                    p_side=p_side,
+                    confidence=stance.confidence,
+                    strength=strength(
+                        p_side, confirm, magnitude, relevant, surprise,
+                        1.0 - new_information,
+                    ),
+                )
 
         return Reading(
             document=document,
@@ -534,13 +821,28 @@ class Reader:
             wall_ms=(time.perf_counter() - started) * 1000.0,
             input_tokens=sum(r.input_tokens for r in responses),
             questions_asked=asked,
+            mode=self.mode,
+            expected_action=expected,
+            p_expected=p_expected,
+            actual_action=actual,
+            p_actual=p_actual,
+            relative=relative,
+            p_relative=p_relative,
+            surprise_channel=channel,
+            p_channel=p_channel,
+            surprise_size=surprise_size,
+            versus_minutes=versus,
+            context_chars=len(context),
             responses=responses,
         )
 
 
 __all__ = [
-    "DiffVerdict", "KINDS", "MAGNITUDE_LEVELS", "INTERVENTION_LEVELS", "PAIRS",
-    "Reader", "Reading", "TICK_SYMBOLS", "TREE_VERSION", "Verdict", "build_state",
-    "pair_for",
+    "ABSOLUTE", "ACTIONS", "ACTION_RANK", "CHANNELS", "CONTEXT", "CONTEXT_VERSION",
+    "DiffVerdict", "KINDS", "MAGNITUDE_LEVELS", "INTERVENTION_LEVELS", "MODES", "PAIRS",
+    "RELATIVE_OPTIONS", "RELATIVE_STANCES", "Reader", "Reading", "SURPRISE_LEVELS",
+    "TICK_SYMBOLS", "TREE_VERSION", "TREE_VERSIONS", "VERSUS_OPTIONS", "Verdict",
+    "build_state", "context_questions", "context_strength", "pair_for",
     "round_one_questions", "round_two_questions", "signed_pair", "strength",
+    "tree_version",
 ]

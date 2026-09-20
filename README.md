@@ -83,6 +83,7 @@ python -m jevtrade.cli sweep                    # what latency costs you
 python -m jevtrade.cli fetch --symbol ETH       # real bars from Kraken
 python -m jevtrade.cli listing --provider mock  # read exchange announcements
 python -m jevtrade.cli fx --provider mock       # read central banks, graded on spot FX
+python -m jevtrade.cli fx --context --provider mock  # statements read against what was priced
 ```
 
 Without `TYPESAFE_API_KEY` the loop runs against an offline stub and says so,
@@ -1064,6 +1065,110 @@ strategy. What it rules out is the keyword bot; what it rules in is only that a
 400 ms reading points the right way for the first half-minute a little more
 often than not, at $0.36 for seventeen years of it.
 
+### Statements in context
+
+The run above buries a negative result. On the **150 FOMC statements** the tape
+moves a lot — mean |move| 15 bp at one minute, 25 at fifteen, 37 at sixty — and
+the reader's direction is a coin flip: 66 traded, **50% at every horizon**, and
+the highest-strength bucket (14 trades) hits **43%**. The three worst calls all
+have the same shape:
+
+| statement | what the text said | what the market did |
+|---|---|---|
+| 2024-12-18 | a cut, and it reads dovish | took it as **hawkish** — the dots moved 2025 from three cuts to two |
+| 2022-11-02 | read one way | the press conference an hour later read the other |
+| 2009-01-28 | promised purchases | had already priced them |
+
+The diagnosis is not that the model reads badly. It is that **a statement is
+read against what the market expected, and the expectation is not in the
+statement.** The absolute tree asks "is this a surprise?" with nothing to be
+surprised against. So `fx/context.py` assembles the expectation and the tree
+gets a second mode that asks the relative question instead.
+
+**What goes in, where it comes from, and what its timestamp has to satisfy.**
+Every item is stamped with the moment it became public, and `Context` refuses to
+exist if any of them is at or after the release:
+
+| piece | source | timestamp rule |
+|---|---|---|
+| rates and what they price | H.15 daily package (Treasury constant maturities) plus the federal funds effective rate | the last row **strictly before the release's UTC date** — the row named after the meeting day prints at 4:15 p.m. ET, two hours after a 2 p.m. statement |
+| the dots | `fomcprojtabl{YYYYMMDD}.htm` (and `fomcprojtable…`, which March 2022 uses) | **concurrent**: published at the release's own minute, the one allowed exception, and labelled as such |
+| the previous statement | `diff.py`'s `Editions`, with a fallback to the last statement when the Fed renamed the release | strictly earlier |
+| the minutes | the last FOMC minutes press release before the meeting, followed to its HTML page | released three weeks after the previous meeting, so strictly earlier |
+| intermeeting communication | the Fed speech and testimony archives | strictly inside `(previous meeting, this release)`, open at both ends |
+| the pair into the release | the cached Dukascopy ticks | the last quote strictly before the release |
+
+Numbers become words on the way in, as everywhere else in this repo: the model
+is told *"the six-month bill yields 4.30 percent against an overnight rate of
+4.58: the market prices roughly one quarter-point cut within six months"*, never
+handed a bill yield and a funds rate to subtract. The raw values stay on the
+dataclasses. Two sanity rules are code's job and are stated because they bite:
+`baseline.announced_rate` reads "at 0 to 1/4 percent" as **1.00**, which is the
+wording of every statement from 2008 to 2015, so a target the effective funds
+rate contradicts is refused and the sentence falls back to the effective rate;
+and the longer-run dot is used to check the alignment of the previous SEP's row,
+because a central tendency printed as a bare number reads as one more median.
+
+**The relative questions** ride in round one next to the whole absolute tree,
+because width is free:
+
+| id | type | asks |
+|---|---|---|
+| `expected_action` | Choice | hike / hold / cut — what *the context* says was expected |
+| `actual_action` | Choice | hike / hold / cut — what the statement did (code cross-checks this against the rate it parsed) |
+| `relative_stance` | Choice | more hawkish / in line / more dovish **than the context implies** |
+| `surprise_channel` | Choice | rate decision, guidance, balance sheet, dots, vote, assessment, nothing |
+| `surprise_size` | Score | nothing they already had → a nuance → a clear surprise → the kind that sets the day |
+| `versus_minutes` | Choice | more hawkish / consistent / more dovish than the minutes and the speeches |
+
+Round two runs only on a decisive relative call or a large surprise, and asks it
+reversed — *"a desk that had read this context, which side of EURUSD for the
+next hour?"* — plus the holder and horizon questions. **The signal's sign comes
+from `relative_stance` and never from `stance`**: on 2024-12-18 a reader that
+gets the statement right has to answer *dovish* to the first question and
+*more hawkish than expected* to the second, and that split is the whole
+point of the mode. Strength is arithmetic:
+`p(relative) × confirm × surprise_size × (1 − priced_in)`, with no half-measure
+damper — the point of handing the reader the expectation is that "the market
+already had this" is a complete answer. The mode has its own cache tag (`ctx1`),
+so the absolute reader's `v1` answers are reused as they are and never re-asked.
+
+**Two numeric baselines, both crude, both labelled.** The instrument that
+actually prices a meeting is the fed funds future, and that is not free. What is
+free is the six-month bill:
+
+- `bill-surprise` — the decision the statement took, minus the one the bill
+  implied. The bill prices the *path* over six months, so the spread over the
+  effective rate is divided by the four meetings six months holds to get a
+  per-meeting expectation. That division is an assumption and the arm inherits
+  its error.
+- `dots-surprise` — the change in next year's median dot against the previous
+  SEP, on projection meetings only. The SEP has published a funds-rate median
+  since September 2015 and printed ranges and a histogram before that, so the
+  arm is dark for the first third of the archive — 44 of the 150 statements
+  have readable dots.
+
+```bash
+python -m jevtrade.cli fx --context --provider jev --tape dukascopy \
+    --since 2009-01-01 --horizons 1,5,15,30,60 --latency 1.0 --latency-sweep \
+    --context-chars 12000 --out runs/fx-jev-fed-context.json
+```
+
+`--context` implies `--issuers fed` and reads statements only. It prints the
+arms table, the latency sweep for the context reader, the confusion between
+`expected_action`/`actual_action` and the rate the code parsed, the distribution
+of `surprise_channel`, and the statements where the absolute and the context
+readers traded against each other with the tape's verdict next to both. The
+`--out` JSON carries every graded signal and, per statement, the timestamp of
+every context item and both readers' answers.
+
+Offline, `--provider mock` assembles the same context and answers it with a
+rule: the pricing sentence for what was expected, the decision verb inside
+"decided to …" for what happened, the gap between the two for the relative call.
+That is a rule and not a reading, and it should score like one.
+
+**The run has not been done yet; the numbers will go here when it has.**
+
 ### What this does not show
 
 **Feed latency is the real bottleneck, and this study cannot measure it.** A
@@ -1111,7 +1216,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 264 tests
+python -m pytest -q      # 325 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -1157,6 +1262,7 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `fx/baseline.py` | the word-counting bot and the rate-surprise bot |
 | `fx/tape.py` | spot FX bars, gap-aware entry and horizons |
 | `fx/ticks.py` | Dukascopy ticks: the book, the entry latency, the spread |
+| `fx/context.py` | the pre-release context, every item stamped and checked |
 | `fx/study.py` | the arms, the session-matched null, the audit |
 | `fx/mock.py` | offline stub for the FX questions |
 

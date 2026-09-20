@@ -7,6 +7,13 @@ words, spots five intervention phrases, and guesses the kind from the title.
 That makes the offline ``jev`` arm a slightly better-dressed keyword bot, and it
 should score like one. The gap between that and the real model is the result.
 
+In context mode it gets one more trick and no more intelligence: it reads the
+*pricing sentence* the context block carries ("prices roughly two quarter-point
+cuts within six months") for what the market expected, the decision verb in the
+statement for what happened, and calls the difference the relative stance. That
+is a rule, not a reading -- it cannot tell a hawkish hold from a dovish one --
+and the context arm run offline should score like the rule it is.
+
 It is deterministic: the same document always gets the same answers, so a cached
 run and a fresh one agree.
 """
@@ -36,6 +43,29 @@ INTERVENTION_PHRASES = (
     (re.compile(r"decisive action|appropriate action|rate check|all options", re.I), 3.0),
     (re.compile(r"excessive|one-?sided|disorderly|rapid (and )?speculative", re.I), 2.0),
     (re.compile(r"exchange rate|currency|foreign exchange|\bfx\b", re.I), 1.0),
+)
+
+# The context block's own wording, which is code's output and therefore fixed.
+_PRICED_HIKES = re.compile(r"prices roughly \d+ quarter-point hikes?", re.I)
+_PRICED_CUTS = re.compile(r"prices roughly \d+ quarter-point cuts?", re.I)
+# What the statement did, from the decision sentence's verb. The verb has to be
+# read inside "decided to ..." and nowhere else: a hold statement that says the
+# Committee "does not expect it will be appropriate to reduce the target range"
+# is a hold, and a rule that greps the whole body for "reduce" calls it a cut.
+_DECIDED = re.compile(r"decided to\s+([^.]{0,200})", re.I)
+_DID_HIKE = re.compile(
+    r"\b(?:raise|raised|raises|increase|increased)\s+the\s+target\s+range|"
+    r"\braise\s+the\s+target\b", re.I)
+_DID_CUT = re.compile(
+    r"\b(?:lower|lowered|lowers|reduce|reduced|cut|cuts)\s+the\s+target\s+range", re.I)
+# Where a surprise would sit, in the order a rule should prefer them.
+_CHANNEL_PATTERNS = (
+    (re.compile(r"\bdots?\b|projections?|median projection|dot plot", re.I), R.DOTS_CHANNEL),
+    (re.compile(r"dissent\w*|voted against|voting against", re.I), R.VOTE_CHANNEL),
+    (re.compile(r"balance sheet|securities holdings|reinvest\w*|runoff|purchases?", re.I),
+     R.BALANCE_SHEET_CHANNEL),
+    (re.compile(r"forward guidance|anticipates?|in determining the (extent|timing)", re.I),
+     R.GUIDANCE_CHANNEL),
 )
 
 _KIND_PATTERNS = (
@@ -69,6 +99,46 @@ def _intervention_level(text: str) -> float:
     return 0.0
 
 
+def expected_action(context: str) -> str:
+    """What the context's pricing sentence says the market expected."""
+    if _PRICED_HIKES.search(context or ""):
+        return R.HIKE
+    if _PRICED_CUTS.search(context or ""):
+        return R.CUT
+    return R.HOLD
+
+
+def actual_action(text: str) -> str:
+    """What the statement's decision verb says it did."""
+    decided = _DECIDED.search(text or "")
+    scope = decided.group(1) if decided else (text or "")
+    if _DID_HIKE.search(scope):
+        return R.HIKE
+    if _DID_CUT.search(scope):
+        return R.CUT
+    return R.HOLD
+
+
+def relative_stance(expected: str, actual: str) -> str:
+    """Hike beats hold beats cut; the gap between the two is the relative call."""
+    gap = R.ACTION_RANK.get(actual, 0) - R.ACTION_RANK.get(expected, 0)
+    if gap > 0:
+        return R.MORE_HAWKISH
+    if gap < 0:
+        return R.MORE_DOVISH
+    return R.IN_LINE
+
+
+def surprise_channel(text: str, rate_surprise: bool) -> str:
+    """The rate itself if that is where the gap is, else the first channel named."""
+    if rate_surprise:
+        return R.RATE_CHANNEL
+    for pattern, channel in _CHANNEL_PATTERNS:
+        if pattern.search(text or ""):
+            return channel
+    return R.NO_CHANNEL
+
+
 def _kind(title: str, feed_kind: str) -> str:
     for pattern, kind in _KIND_PATTERNS:
         if pattern.search(title or ""):
@@ -97,7 +167,18 @@ class MockFxClient:
         talky = kind in (R.MINUTES, R.PRESS_CONFERENCE)
         level = 2.6 if kind == R.RATE_DECISION else (1.6 if talky else 0.6)
         currency = str(state.get("currency", ""))
-        want = {R.HAWKISH: R.BUY, R.DOVISH: R.SELL}.get(stance, R.NEITHER)
+        context = str(state.get("context_before_the_release", ""))
+        expected = expected_action(context)
+        did = actual_action(text)
+        relative = relative_stance(expected, did)
+        channel = surprise_channel(text, relative != R.IN_LINE)
+        # Size follows the rule's own confidence: a rate surprise is the day, a
+        # channel with no rate surprise is a nuance, and nothing is nothing.
+        size = 3.0 if relative != R.IN_LINE else (1.0 if channel != R.NO_CHANNEL else 0.0)
+        if state.get("round") == 2 and context:
+            want = {R.MORE_HAWKISH: R.BUY, R.MORE_DOVISH: R.SELL}.get(relative, R.NEITHER)
+        else:
+            want = {R.HAWKISH: R.BUY, R.DOVISH: R.SELL}.get(stance, R.NEITHER)
 
         answers: dict[str, Any] = {}
         for key, question in (self.questions or {}).items():
@@ -108,6 +189,22 @@ class MockFxClient:
                 answers[key] = _choice(stance, options, 0.45 + 0.45 * lopsided)
             elif key == R.STANCE_REVERSED:
                 answers[key] = _choice(want, options, 0.45 + 0.45 * lopsided)
+            elif key == R.EXPECTED_ACTION:
+                answers[key] = _choice(expected, options, 0.6)
+            elif key == R.ACTUAL_ACTION:
+                answers[key] = _choice(did, options, 0.7)
+            elif key == R.RELATIVE_STANCE:
+                answers[key] = _choice(relative, options, 0.45 + 0.35 * lopsided)
+            elif key == R.SURPRISE_CHANNEL:
+                answers[key] = _choice(channel, options, 0.5)
+            elif key == R.SURPRISE_SIZE:
+                answers[key] = _score(size, options)
+            elif key == R.VERSUS_MINUTES:
+                answers[key] = _choice(
+                    {R.MORE_HAWKISH: R.VS_MORE_HAWKISH,
+                     R.MORE_DOVISH: R.VS_MORE_DOVISH}.get(relative, R.VS_CONSISTENT),
+                    options, 0.55,
+                )
             elif key == R.HORIZON:
                 answers[key] = _choice(
                     R.HOURS_H if kind == R.RATE_DECISION else R.MINUTES_H, options, 0.6
@@ -177,4 +274,7 @@ def _score(level: float, levels: list[str]) -> ScoreAnswer:
     )
 
 
-__all__ = ["MockFxClient", "HAWKISH_WORDS", "DOVISH_WORDS"]
+__all__ = [
+    "DOVISH_WORDS", "HAWKISH_WORDS", "MockFxClient", "actual_action",
+    "expected_action", "relative_stance", "surprise_channel",
+]

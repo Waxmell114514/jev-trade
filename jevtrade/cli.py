@@ -608,8 +608,379 @@ def cmd_listing(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fx_context(args: argparse.Namespace) -> int:
+    """Read FOMC statements *against* what the market already had.
+
+    The absolute reader scored a coin flip on the 150 statements in the archive:
+    50% at every horizon, and 43% in its most confident bucket. This arm hands
+    the same tree the pre-release context and asks the relative question
+    instead, next to two numeric baselines that ask it with arithmetic.
+    """
+    import concurrent.futures
+    import os
+    import statistics
+    import threading
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from typing import Callable
+
+    from .fx import context as C
+    from .fx import diff as DF
+    from .fx import documents as D
+    from .fx import reader as R
+    from .fx import study as S
+    from .fx.diff import Editions
+    from .fx.reader import Reader
+    from .listing.store import Store
+
+    def day_epoch(text: str) -> float:
+        return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+
+    store = Store(args.cache)
+    horizons = tuple(int(h) for h in args.horizons.split(","))
+    ticks = args.tape == "dukascopy"
+    now = time.time()
+    since = day_epoch(args.since) if args.since else now - args.days * 86400
+    until = day_epoch(args.until) + 86400 if args.until else now
+    if until <= since:
+        print("--until is not after --since", file=sys.stderr)
+        return 1
+
+    # --context is a Fed study by construction: the ECB, BoJ and BoE feeds are
+    # RSS and fifteen items deep, so there is no prior context to assemble.
+    found = D.collect(store, since=since, until=until, issuers=("fed",),
+                      kinds=("monetary_policy", "speech", "testimony"),
+                      limit=args.limit, workers=args.workers_io)
+    documents = found.documents
+    statements = S.statements(documents)
+    if not statements:
+        print("no FOMC statements in range", file=sys.stderr)
+        return 1
+    first, last = statements[0].when, statements[-1].when
+    print(f"{len(statements)} FOMC statements, {first:%Y-%m-%d} to {last:%Y-%m-%d}, "
+          f"out of {len(documents)} Fed documents in the window")
+
+    # The minutes that precede the first statement were released before the
+    # window opens, so the archive is read a quarter earlier than the study.
+    archive_rows, _ = D.fed_archive(store, since - 120 * 86400, until=until)
+    table = C.rates_h15(store)
+    if not len(table):
+        # H.15 is primary; the Treasury's own par-yield files are the fallback
+        # and carry no funds rate, so the pricing sentences lose their anchor.
+        years = range(datetime.fromtimestamp(since, timezone.utc).year,
+                      datetime.fromtimestamp(until, timezone.utc).year + 1)
+        table = C.rates_treasury(store, years)
+        print("H.15 gave nothing; falling back to the Treasury par-yield files",
+              file=sys.stderr)
+    if len(table):
+        print(f"rates: {len(table)} daily rows, {table.dates[0]} to {table.dates[-1]}, "
+              f"series {', '.join(sorted(table.series))}")
+    else:
+        print("rates: none -- the context will carry no pricing sentences", file=sys.stderr)
+
+    tapes = S.TickTapes(store, workers=args.workers_io) if ticks else None
+    drift_tape = tapes.get("EURUSD=X") if tapes is not None else None
+    editions = Editions(statements)
+    calendar = D.calendar_rows(store)
+
+    started = time.perf_counter()
+    done = {"n": 0}
+    guard = threading.Lock()
+
+    def build(document: D.Document) -> tuple[D.Document, C.Context | None, str]:
+        previous = C.previous_statement(document, statements, editions=editions)
+        local = D.local_string(document.ts, "fed")[:10].replace("-", "")
+        try:
+            context = C.context_for(
+                document, store=store, table=table, archive_rows=archive_rows,
+                documents=documents, previous=previous, tape=drift_tape, local_date=local,
+            )
+            note = ""
+        except C.LookaheadError as exc:
+            context, note = None, str(exc)
+        with guard:
+            done["n"] += 1
+            seen = done["n"]
+        if seen % 25 == 0 or seen == len(statements):
+            print(f"  context {seen}/{len(statements)}, "
+                  f"{time.perf_counter() - started:.0f}s", file=sys.stderr, flush=True)
+        return document, context, note
+
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.workers_io)) as pool:
+        built = list(pool.map(build, statements))
+    contexts = {d.id: c for d, c, _ in built if c is not None}
+    lookahead = [(d, note) for d, c, note in built if c is None]
+    previous_of_id = {d.id: contexts[d.id].previous for d in statements
+                      if d.id in contexts and contexts[d.id].previous is not None}
+    texts = {doc_id: ctx.as_text(args.context_chars) for doc_id, ctx in contexts.items()}
+
+    have = {k: sum(1 for c in contexts.values() if c.has[k]) for k in
+            ("rates", "dots", "previous", "minutes", "chair", "communication", "drift")}
+    lengths = sorted(len(t) for t in texts.values()) or [0]
+    print("context: " + ", ".join(f"{k} {v}/{len(statements)}" for k, v in have.items())
+          + f"; median {lengths[len(lengths) // 2]} chars"
+          + f" (cap {args.context_chars})")
+    if lookahead:
+        print(f"  {len(lookahead)} statement(s) refused for lookahead:")
+        for document, note in lookahead[: args.show]:
+            print(f"    {document.when:%Y-%m-%d} {note}")
+
+    def make_reader(mode: str) -> Callable[[], Reader]:
+        def factory() -> Reader:
+            if args.provider == "mock" or (
+                args.provider == "auto" and not os.environ.get("TYPESAFE_API_KEY")
+            ):
+                from .fx.mock import MockFxClient
+
+                return Reader(MockFxClient(), mode=mode)
+            return Reader(resolve_client(args.provider, timeout_s=20.0), mode=mode)
+        return factory
+
+    provider = make_reader(R.ABSOLUTE)().client.provider
+
+    # How many of the absolute readings this run can reuse instead of re-asking.
+    cached = 0
+    for document in statements:
+        previous, changes = DF.diff_for(document, editions, limit=12)
+        row = D.match_calendar(document, calendar) if calendar else None
+        key = (f"reading:{provider}:{R.TREE_VERSION}:{document.id}:"
+               f"{S.state_hash(document, changes, row)}")
+        cached += 1 if store.get(key)[0] else 0
+    print(f"reader-absolute: {cached}/{len(statements)} already in the "
+          f"{provider}:{R.TREE_VERSION} cache and reused as they are")
+
+    read_started = time.perf_counter()
+
+    def progress(tag: str):
+        def report(done: int, total: int, round_two: int, cost: float) -> None:
+            print(f"  {tag} {done}/{total}, {round_two} to round two, ${cost:.3f}, "
+                  f"{time.perf_counter() - read_started:.0f}s", file=sys.stderr, flush=True)
+        return report
+
+    absolute = S.read_all(
+        statements, make_reader(R.ABSOLUTE),
+        store=None if args.no_reading_cache else store,
+        cache_tag=f"{provider}:{R.TREE_VERSION}", calendar=calendar,
+        workers=args.workers, progress=progress("absolute"), progress_every=50,
+    )
+    contextual = S.read_all(
+        statements, make_reader(R.CONTEXT),
+        store=None if args.no_reading_cache else store,
+        cache_tag=f"{provider}:{R.CONTEXT_VERSION}", calendar=calendar,
+        contexts=texts, workers=args.workers, progress=progress("context"),
+        progress_every=50,
+    )
+    widths = sorted(r.questions_asked for r in contextual)
+    walls = sorted(r.wall_ms for r in contextual)
+    print(
+        f"reader-context ({provider}): {len(contextual)} statements, "
+        f"{sum(r.rounds == 2 for r in contextual)} went to round two, "
+        f"{widths[len(widths) // 2]} questions in the median statement, "
+        f"median {statistics.median(walls):.0f} ms, "
+        f"${S.cost_usd(contextual):.3f} of input tokens, "
+        f"{time.perf_counter() - read_started:.0f}s wall"
+    )
+
+    if ticks:
+        tape = tapes
+    else:
+        span = max(1.0, (until - since) / 86400.0)
+        tape = S.Tape(store, bar_min=args.bar,
+                      days=min(int(max(span, 7)), 60 if args.bar >= 5 else 7))
+    graded = dict(horizons=horizons, workers=args.workers_io, latency_s=args.latency)
+
+    absolute_signals = S.reader_signals(absolute, args.threshold)
+    context_signals = S.reader_signals(contextual, args.threshold)
+    arms: list[tuple[str, list[S.Signal], str]] = [
+        ("reader-absolute", absolute_signals, "the v1 tree, reused from cache"),
+        ("reader-context", context_signals, "the ctx1 tree, relative to the context"),
+        ("bill-surprise", S.bill_surprise_signals(statements, contexts,
+                                                  previous_of_id=previous_of_id),
+         "crude proxy for fed funds futures"),
+        ("dots-surprise", S.dots_surprise_signals(statements, contexts),
+         "projection meetings only"),
+        ("all statements", S.all_text_signals(statements), "keyword sign, every statement"),
+    ]
+    summaries: list[S.ArmSummary] = []
+    per_arm: list[list[S.Outcome]] = []
+    pool_outcomes: list[S.Outcome] = []
+    for name, signals, note in arms:
+        outcomes = S.measure(tape, signals, **graded)
+        nulls = S.measure(tape, S.null_signals(tape, outcomes, per=args.null_per,
+                                               horizons=horizons, latency_s=args.latency,
+                                               workers=args.workers_io), **graded)
+        summaries.append(S.summarize(name, signals, outcomes, nulls, horizons=horizons,
+                                     note=note, latency_s=args.latency if ticks else 0.0))
+        per_arm.append(outcomes)
+        pool_outcomes.extend(outcomes)
+
+    hz = "".join(f"{'+' + str(h) + 'm':>9}" for h in horizons)
+    lead = f"{'pre':>7}{'rush':>7}{'sprd':>6}" if ticks else f"{'pre':>7}{'bar':>7}"
+    print(
+        "\nSigned log return per signal, bps, on FOMC statements only"
+        + (f", entering on the first tick at\nor after the release + {args.latency:g}s, "
+           "paying the ask to go long and the bid to go short."
+           if ticks else f", entering at the open of the first\n{args.bar}-minute bar after it.")
+        + "\nz is against the same pair and side at random moments within 5 days."
+    )
+    print(f"\n{'arm':<16}{'signals':>8}{'traded':>7}{lead}{hz}{'hit15':>7}{'z15':>7}")
+    print("-" * (16 + 8 + 7 + len(lead) + 9 * len(horizons) + 14))
+    for s in summaries:
+        cells = "".join(f"{s.fwd[h].mean:>+9.0f}" for h in horizons)
+        values = (f"{s.pre.mean:>+7.0f}{s.rush.mean:>+7.0f}{s.spread.mean:>6.1f}" if ticks
+                  else f"{s.pre.mean:>+7.0f}{s.release_bar.mean:>+7.0f}")
+        blank = " " * len(lead)
+        print(f"{s.name:<16}{s.signals:>8}{s.measured:>7}{values}{cells}"
+              f"{s.hit.get(15, 0.0):>7.0%}{s.z.get(15, 0.0):>+7.1f}")
+        errs = "".join(f"{'+-' + format(s.fwd[h].se, '.0f'):>9}" for h in horizons)
+        null = "".join(f"{s.null[h].mean:>+9.0f}" for h in horizons)
+        print(f"{'  s.e.':<16}{'':>8}{'':>7}{blank}{errs}")
+        print(f"{'  null':<16}{'':>8}{'':>7}{blank}{null}")
+        if s.note:
+            print(f"{'  (' + s.note + ')':<16}")
+
+    print("\nhit rate and mean signed return per arm, at every horizon:")
+    print(f"{'arm':<16}{'traded':>8}"
+          + "".join(f"{'hit+' + str(h) + 'm':>9}{'mean':>7}" for h in horizons))
+    for s in summaries:
+        print(f"{s.name:<16}{s.measured:>8}"
+              + "".join(f"{s.hit.get(h, 0.0):>9.0%}{s.fwd[h].mean:>+7.0f}" for h in horizons))
+
+    sweep: list[S.ArmSummary] = []
+    if args.latency_sweep and not ticks:
+        print("\n--latency-sweep needs --tape dukascopy; 5-minute bars have one latency",
+              file=sys.stderr)
+    elif args.latency_sweep:
+        swept = context_signals if len(context_signals) >= 5 else arms[4][1]
+        sweep_h = tuple(h for h in (15, 60) if h in horizons) or (horizons[-1],)
+        sweep = S.latency_sweep(tape, swept, horizons=sweep_h, per=args.null_per,
+                                workers=args.workers_io)
+        print(f"\nlatency sweep (reader-context, {len(swept)} signals, net of the half spread):")
+        cols = "".join(f"{'+' + str(h) + 'm':>8}{'s.e.':>7}{'null':>8}{'z':>6}" for h in sweep_h)
+        print(f"{'entry':>8}{'traded':>8}{'rush':>7}{'sprd':>6}{cols}")
+        for row in sweep:
+            cells = "".join(
+                f"{row.fwd[h].mean:>+8.0f}{row.fwd[h].se:>7.0f}"
+                f"{row.null[h].mean:>+8.0f}{row.z[h]:>+6.1f}" for h in sweep_h)
+            print(f"{row.name:>8}{row.measured:>8}{row.rush.mean:>+7.0f}"
+                  f"{row.spread.mean:>6.1f}{cells}")
+
+    actual = S.action_confusion(contextual, previous_of_id, field_name="actual_action")
+    expected = S.action_confusion(contextual, previous_of_id, field_name="expected_action")
+    print(f"\nwhat the model said the statement did, against the rate the code parsed"
+          f" ({actual.n} statements, {actual.unparsed} unparseable):")
+    print(f"{'parsed':>10}" + "".join(f"{a:>8}" for a in R.ACTIONS))
+    for parsed in R.ACTIONS:
+        print(f"{parsed:>10}" + "".join(
+            f"{actual.rows.get((parsed, model), 0):>8}" for model in R.ACTIONS))
+    print(f"  actual_action agrees with the parsed decision {actual.agreed}/{actual.n} "
+          f"({actual.rate:.0%}); expected_action matches what happened "
+          f"{expected.agreed}/{expected.n} ({expected.rate:.0%})")
+
+    channels = S.channel_counts(contextual)
+    print("where it put the surprise: " + (", ".join(
+        f"{k} {v}" for k, v in sorted(channels.items(), key=lambda kv: -kv[1])) or "nowhere"))
+    relatives: dict[str, int] = {}
+    for reading in contextual:
+        relatives[reading.relative] = relatives.get(reading.relative, 0) + 1
+    print("relative stance: " + ", ".join(
+        f"{k or 'none'} {v}" for k, v in sorted(relatives.items(), key=lambda kv: -kv[1])))
+
+    splits = S.signal_disagreements(absolute_signals, context_signals, pool_outcomes,
+                                    horizon=horizons[min(1, len(horizons) - 1)])
+    splits.sort(key=lambda d: -max([abs(v) for v in d.outcomes.values()] or [0.0]))
+    horizon = horizons[min(1, len(horizons) - 1)]
+    print(f"\nwhere the absolute and the context readers traded differently "
+          f"({len(splits)} of {len(statements)}); +{horizon}m bps per pair:")
+    for d in splits[: args.show]:
+        when = datetime.fromtimestamp(d.when, timezone.utc)
+        fmt = lambda rows: ", ".join(  # noqa: E731
+            f"{'long' if s > 0 else 'short'} {p}" for p, s in rows) or "nothing"
+        moves = ", ".join(f"{p} {v:+.0f}" for p, v in d.outcomes.items()) or "no tape"
+        print(f"  {when:%Y-%m-%d %H:%M} {d.title[:62]}")
+        print(f"  absolute: {fmt(d.bot)[:70]}")
+        print(f"   context: {fmt(d.reader)[:70]}")
+        print(f"      tape: {moves[:70]}")
+
+    if args.out:
+        def outcome_row(o: S.Outcome) -> dict[str, Any]:
+            return {
+                "ts": o.signal.ts, "title": o.signal.title, "pair": o.signal.pair,
+                "side": o.signal.sign, "strength": o.signal.strength,
+                "pre_bps": o.pre_bps, "rush_bps": o.rush_bps,
+                "spread_bps": o.spread_bps, "latency_s": o.latency_s,
+                "entry_ts": o.entry_ts,
+                "fwd_bps": {h: o.fwd_bps.get(h) for h in horizons},
+                "fwd_mid_bps": {h: o.fwd_mid_bps.get(h) for h in horizons},
+            }
+
+        by_id = {r.document.id: r for r in absolute}
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "provider": provider, "tree": R.CONTEXT_VERSION, "mode": "context",
+            "since": since, "until": until, "tape": args.tape,
+            "latency_s": args.latency if ticks else None,
+            "threshold": args.threshold, "horizons": horizons,
+            "context_chars": args.context_chars,
+            "statements": len(statements), "documents": len(documents),
+            "coverage": have,
+            "absolute_cached": cached,
+            "lookahead_refused": [
+                {"ts": d.ts, "title": d.title, "why": note} for d, note in lookahead
+            ],
+            "arms": [
+                {"name": s.name, "signals": s.signals, "measured": s.measured,
+                 "note": s.note, "pre": asdict(s.pre),
+                 "spread": asdict(s.spread), "rush": asdict(s.rush),
+                 "fwd": {h: asdict(v) for h, v in s.fwd.items()},
+                 "fwd_mid": {h: asdict(v) for h, v in s.fwd_mid.items()},
+                 "null": {h: asdict(v) for h, v in s.null.items()},
+                 "hit": s.hit, "z": s.z,
+                 "outcomes": [outcome_row(o) for o in outcomes]}
+                for s, outcomes in zip(summaries, per_arm)
+            ],
+            "latency_sweep": [
+                {"latency_s": r.latency_s, "signals": r.signals, "measured": r.measured,
+                 "spread": asdict(r.spread), "rush": asdict(r.rush),
+                 "fwd": {h: asdict(v) for h, v in r.fwd.items()},
+                 "null": {h: asdict(v) for h, v in r.null.items()}, "z": r.z}
+                for r in sweep
+            ],
+            "confusion": {
+                "actual": {f"{k[0]}->{k[1]}": v for k, v in actual.rows.items()},
+                "expected": {f"{k[0]}->{k[1]}": v for k, v in expected.rows.items()},
+                "unparsed": actual.unparsed,
+            },
+            "surprise_channels": channels,
+            "statements_read": [
+                {
+                    "id": r.document.id, "ts": r.document.ts, "title": r.document.title,
+                    "context_sources": [
+                        {"kind": s.kind, "label": s.label, "ts": s.ts,
+                         "concurrent": s.concurrent}
+                        for s in (contexts[r.document.id].sources
+                                  if r.document.id in contexts else [])
+                    ],
+                    "context_chars": r.context_chars,
+                    "parsed_decision": S.decision_from_rates(
+                        r.document, previous_of_id.get(r.document.id)),
+                    "context_reading": S.reading_to_dict(r),
+                    "absolute_reading": (S.reading_to_dict(by_id[r.document.id])
+                                         if r.document.id in by_id else None),
+                }
+                for r in contextual
+            ],
+        }, ensure_ascii=False, indent=1))
+        print(f"\nwrote {out}")
+    return 0
+
+
 def cmd_fx(args: argparse.Namespace) -> int:
     """Read central-bank text in one second; let the spot tape grade every arm."""
+    if args.context:
+        return cmd_fx_context(args)
     import os
     import statistics
     import time
@@ -1029,6 +1400,11 @@ def build_parser() -> argparse.ArgumentParser:
     fx.add_argument("--workers-io", type=int, default=8, help="parallel fetches")
     fx.add_argument("--null-per", type=int, default=2, help="random controls per measured signal")
     fx.add_argument("--show", type=int, default=8, help="disagreements to print")
+    fx.add_argument("--context", action="store_true",
+                    help="FOMC statements only, read against the pre-release context "
+                         "(implies --issuers fed)")
+    fx.add_argument("--context-chars", type=int, default=12000,
+                    help="character budget for the assembled context block")
     fx.add_argument("--snapshot-calendar", action="store_true",
                     help="store this week's calendar so the surprise arm can run later")
     fx.add_argument("--out", default="", help="write a JSON record of the run")

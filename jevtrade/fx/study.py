@@ -27,6 +27,15 @@ Four arms sit next to the reader:
                    events move the spot tape at all, relative to nothing
                    happening -- and if it does not, nothing downstream matters.
 * ``reader``       the two-round tree, at a strength threshold
+
+The context run adds two more, both of them numbers rather than readings, so
+the relative reader has something to be relative *against*:
+
+* ``bill-surprise`` the decision the statement took against the one the
+                    six-month bill implied. It is a crude proxy for fed funds
+                    futures, which are not free, and it is labelled as one.
+* ``dots-surprise`` the change in next year's median dot against the previous
+                    SEP, on projection meetings only.
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import statistics
 import threading
 from dataclasses import dataclass, field
@@ -43,10 +53,23 @@ from typing import Any, Callable, Iterable, Sequence
 
 from ..listing.store import Store
 from . import tape as _tape
-from .baseline import BotSignal, keyword_bot, surprise_bot
+from .baseline import BotSignal, announced_rate, keyword_bot, surprise_bot
+from .context import MEETINGS_PER_SIX_MONTHS, Context, quarter_steps
 from .diff import Editions, diff_for
 from .documents import Document, match_calendar
-from .reader import DiffVerdict, Reader, Reading, Verdict, signed_pair
+from .reader import (
+    ABSOLUTE,
+    CUT,
+    DOVISH,
+    HAWKISH,
+    HIKE,
+    HOLD,
+    DiffVerdict,
+    Reader,
+    Reading,
+    Verdict,
+    signed_pair,
+)
 from .tape import HORIZONS, Bars, forward_returns
 from .ticks import (
     DEFAULT_LATENCY_S,
@@ -364,6 +387,121 @@ def all_text_signals(documents: Sequence[Document]) -> list[Signal]:
     return out
 
 
+FOMC_STATEMENT = re.compile(r"fomc statement", re.I)
+
+
+def statements(documents: Sequence[Document]) -> list[Document]:
+    """The FOMC statements in a collection, by title, oldest first.
+
+    This is the same filter the 2009-2026 run used to split its results, so the
+    count (150 over the archive) is comparable. It keeps a handful of documents
+    that are not rate decisions -- swap-line announcements, the longer-run goals
+    statement -- because the title is what the filter has and inventing a
+    second, unstated rule would make the two runs incomparable.
+    """
+    return sorted(
+        [d for d in documents if FOMC_STATEMENT.search(d.title or "")], key=lambda d: d.ts
+    )
+
+
+def decision_from_rates(document: Document, previous: Document | None) -> str | None:
+    """hike / hold / cut, from the rate the code parsed out of each statement.
+
+    ``None`` when either statement's target range could not be parsed, which is
+    an answer and not a zero: a statement whose rate is unreadable must not be
+    counted as a hold.
+    """
+    if previous is None:
+        return None
+    now = announced_rate(f"{document.title}\n{document.body}")
+    before = announced_rate(f"{previous.title}\n{previous.body}")
+    if now is None or before is None:
+        return None
+    if abs(now - before) < 1e-9:
+        return HOLD
+    return HIKE if now > before else CUT
+
+
+def bill_surprise_signals(
+    documents: Sequence[Document],
+    contexts: dict[str, Context],
+    *,
+    previous_of_id: dict[str, Document] | None = None,
+) -> list[Signal]:
+    """The decision against the one the six-month bill implied.
+
+    **This is a crude proxy.** The instrument that actually prices a meeting is
+    the fed funds future, and that is not free. What is free is the six-month
+    bill, which prices the average funds rate over six months; the spread over
+    the effective rate is therefore the whole *path*, not this meeting, and the
+    path is divided by the four meetings six months holds to get a per-meeting
+    expectation. That division is an assumption and the arm inherits its error.
+    A surprise inside one basis point is no signal.
+    """
+    previous_of_id = previous_of_id or {}
+    out: list[Signal] = []
+    for document in documents:
+        context = contexts.get(document.id)
+        if context is None or context.rates is None:
+            continue
+        bill = context.rates.values.get("6m")
+        effective = context.rates.values.get("ff")
+        previous = previous_of_id.get(document.id) or context.previous
+        if bill is None or effective is None or previous is None:
+            continue
+        now = announced_rate(f"{document.title}\n{document.body}")
+        before = announced_rate(f"{previous.title}\n{previous.body}")
+        if now is None or before is None:
+            continue
+        expected = (bill - effective) / MEETINGS_PER_SIX_MONTHS
+        gap = (now - before) - expected
+        if abs(gap) < 0.01:
+            continue
+        signed = signed_pair(document.currency, HAWKISH if gap > 0 else DOVISH)
+        if signed is None:
+            continue
+        out.append(Signal(document.id, document.ts, document.title, signed[0], signed[1],
+                          min(1.0, abs(gap) / 0.25)))
+    return out
+
+
+def dots_surprise_signals(
+    documents: Sequence[Document], contexts: dict[str, Context]
+) -> list[Signal]:
+    """The change in next year's median dot against the previous SEP.
+
+    Projection meetings only, and only the ones whose table carries a funds-rate
+    *median*: the SEP has published one since September 2015 and printed ranges
+    and a histogram before that, so the arm is dark for the first third of the
+    archive. No signal when the median did not move, or when the previous SEP
+    had no cell for that year. A higher median is fewer cuts, which is hawkish
+    for the dollar.
+    """
+    out: list[Signal] = []
+    for document in documents:
+        context = contexts.get(document.id)
+        if context is None or context.projections is None:
+            continue
+        dots = context.projections
+        # The current year's column is nearly over by December and the longer
+        # run is not a path; next year is the one the market trades.
+        index = 1 if len(dots.years) > 2 else 0
+        if index >= len(dots.medians) or index >= len(dots.previous):
+            continue
+        was = dots.previous[index]
+        if was is None:
+            continue
+        gap = dots.medians[index] - was
+        if abs(gap) < 1e-9:
+            continue
+        signed = signed_pair(document.currency, HAWKISH if gap > 0 else DOVISH)
+        if signed is None:
+            continue
+        out.append(Signal(document.id, document.ts, document.title, signed[0], signed[1],
+                          min(1.0, abs(quarter_steps(gap)) / 4.0)))
+    return out
+
+
 def reader_signals(
     readings: Sequence[Reading], threshold: float, *, min_confidence: float = 0.5
 ) -> list[Signal]:
@@ -505,6 +643,7 @@ def state_hash(
     calendar: dict[str, Any] | None,
     *,
     body_chars: int = 6000,
+    context: str = "",
 ) -> str:
     """A short digest of everything round one will see besides the tree itself.
 
@@ -514,17 +653,19 @@ def state_hash(
     window has one, twelve changed sentences, and a different answer. The id and
     the tree version cannot see that, so the state does.
     """
-    payload = json.dumps(
-        [
-            document.title,
-            (document.body or "")[:body_chars],
-            [list(pair) for pair in changes],
-            None if not calendar else [
-                calendar.get(k, "") for k in ("title", "impact", "forecast", "previous")
-            ],
+    parts: list[Any] = [
+        document.title,
+        (document.body or "")[:body_chars],
+        [list(pair) for pair in changes],
+        None if not calendar else [
+            calendar.get(k, "") for k in ("title", "impact", "forecast", "previous")
         ],
-        ensure_ascii=False,
-    )
+    ]
+    # Appended only when there is one, so every ``v1`` digest ever written stays
+    # exactly what it was and the absolute reader's cache is still valid.
+    if context:
+        parts.append(hashlib.sha1(context.encode("utf-8")).hexdigest()[:10])
+    payload = json.dumps(parts, ensure_ascii=False)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
 
 
@@ -538,6 +679,7 @@ def read_all(
     max_diffs: int = 12,
     workers: int = 1,
     body_chars: int = 6000,
+    contexts: dict[str, str] | None = None,
     progress: Callable[[int, int, int, float], None] | None = None,
     progress_every: int = 100,
 ) -> list[Reading]:
@@ -547,6 +689,10 @@ def read_all(
     document list, so a statement read in isolation and one read inside a run
     see the same changed sentences -- and it is computed *before* the cache is
     consulted, because it is part of what the cache key means.
+
+    ``contexts`` maps a document id to the pre-release context block the reader
+    should be handed, and is part of the cache key: two readings of the same
+    statement against different context are different readings.
 
     ``progress`` is called with ``(done, total, went to round two, dollars so
     far)`` every ``progress_every`` documents, because a 2,300-document run is
@@ -567,15 +713,17 @@ def read_all(
     def one(document: Document) -> Reading:
         previous, changes = diff_for(document, editions, limit=max_diffs)
         row = match_calendar(document, rows) if rows else None
+        context = (contexts or {}).get(document.id, "")
         key = (f"reading:{cache_tag}:{document.id}:"
-               f"{state_hash(document, changes, row, body_chars=body_chars)}")
+               f"{state_hash(document, changes, row, body_chars=body_chars, context=context)}")
         result: Reading | None = None
         if store is not None:
             found, data = store.get(key)
             if found:
                 result = reading_from_dict(document, data)
         if result is None:
-            result = reader().read(document, previous=previous, changes=changes, calendar=row)
+            result = reader().read(document, previous=previous, changes=changes,
+                                   calendar=row, context=context)
             if store is not None:
                 store.put(key, reading_to_dict(result))
         with guard:
@@ -604,6 +752,12 @@ def reading_to_dict(reading: Reading) -> dict[str, Any]:
         "horizon": reading.horizon, "rounds": reading.rounds,
         "latency_ms": reading.latency_ms, "wall_ms": reading.wall_ms,
         "input_tokens": reading.input_tokens, "questions_asked": reading.questions_asked,
+        "mode": reading.mode, "expected_action": reading.expected_action,
+        "p_expected": reading.p_expected, "actual_action": reading.actual_action,
+        "p_actual": reading.p_actual, "relative": reading.relative,
+        "p_relative": reading.p_relative, "surprise_channel": reading.surprise_channel,
+        "p_channel": reading.p_channel, "surprise_size": reading.surprise_size,
+        "versus_minutes": reading.versus_minutes, "context_chars": reading.context_chars,
         "diffs": [
             {"index": d.index, "was": d.was, "now": d.now, "stance": d.stance,
              "p_stance": d.p_stance, "material": d.material}
@@ -630,6 +784,16 @@ def reading_from_dict(document: Document, data: dict[str, Any]) -> Reading:
         verdict=None if verdict is None else Verdict(**verdict),
         rounds=data["rounds"], latency_ms=data["latency_ms"], wall_ms=data["wall_ms"],
         input_tokens=data["input_tokens"], questions_asked=data.get("questions_asked", 0),
+        # ``.get`` throughout: a reading cached before the context tree existed
+        # is still a valid absolute reading and must keep loading.
+        mode=data.get("mode", ABSOLUTE),
+        expected_action=data.get("expected_action", ""), p_expected=data.get("p_expected", 0.0),
+        actual_action=data.get("actual_action", ""), p_actual=data.get("p_actual", 0.0),
+        relative=data.get("relative", ""), p_relative=data.get("p_relative", 0.0),
+        surprise_channel=data.get("surprise_channel", ""), p_channel=data.get("p_channel", 0.0),
+        surprise_size=data.get("surprise_size", 0.0),
+        versus_minutes=data.get("versus_minutes", ""),
+        context_chars=data.get("context_chars", 0),
     )
 
 
@@ -648,6 +812,102 @@ class Disagreement:
     bot: list[tuple[str, int]]
     reader: list[tuple[str, int]]
     outcomes: dict[str, float]  # pair -> unsigned forward return at one horizon, bps
+
+
+@dataclass
+class Confusion:
+    """How often the model's reading of the decision matches the parsed rate.
+
+    ``actual`` is the interesting one: it is a fact, not a judgment, so a model
+    that gets it wrong cannot be trusted on the judgment that sits on top of it.
+    ``expected`` is not a fact -- nothing here knows what the market expected --
+    so its agreement with the decision is reported as what it is: how often the
+    model thought the market had already priced what happened.
+    """
+
+    rows: dict[tuple[str, str], int] = field(default_factory=dict)  # (parsed, model) -> n
+    unparsed: int = 0
+
+    @property
+    def n(self) -> int:
+        return sum(self.rows.values())
+
+    @property
+    def agreed(self) -> int:
+        return sum(v for (parsed, model), v in self.rows.items() if parsed == model)
+
+    @property
+    def rate(self) -> float:
+        return self.agreed / self.n if self.n else 0.0
+
+
+def action_confusion(
+    readings: Sequence[Reading],
+    previous_of_id: dict[str, Document],
+    *,
+    field_name: str = "actual_action",
+) -> Confusion:
+    """Cross-check one of the model's action answers against the parsed rate."""
+    out = Confusion()
+    for reading in readings:
+        answer = getattr(reading, field_name, "")
+        if not answer:
+            continue
+        parsed = decision_from_rates(reading.document, previous_of_id.get(reading.document.id))
+        if parsed is None:
+            out.unparsed += 1
+            continue
+        key = (parsed, answer)
+        out.rows[key] = out.rows.get(key, 0) + 1
+    return out
+
+
+def channel_counts(readings: Sequence[Reading]) -> dict[str, int]:
+    """How the reader distributed the surprise across the six channels."""
+    out: dict[str, int] = {}
+    for reading in readings:
+        if reading.surprise_channel:
+            out[reading.surprise_channel] = out.get(reading.surprise_channel, 0) + 1
+    return out
+
+
+def signal_disagreements(
+    left: Sequence[Signal],
+    right: Sequence[Signal],
+    outcomes: Sequence[Outcome],
+    *,
+    horizon: int = 15,
+) -> list[Disagreement]:
+    """Documents two arms traded differently, with what the tape then did.
+
+    The tape's verdict is unsigned by either arm -- it is the pair's own move at
+    the horizon -- so a reader of the list can see which side was right without
+    the table having already decided.
+    """
+    by_key: dict[tuple[str, str], float] = {}
+    for outcome in outcomes:
+        if horizon in outcome.fwd_bps:
+            by_key[(outcome.signal.code, outcome.signal.pair)] = (
+                outcome.fwd_bps[horizon] * outcome.signal.sign
+            )
+    index: dict[str, Signal] = {s.code: s for s in list(left) + list(right)}
+    per_side: list[dict[str, list[tuple[str, int]]]] = []
+    for group in (left, right):
+        rows: dict[str, list[tuple[str, int]]] = {}
+        for signal in group:
+            rows.setdefault(signal.code, []).append((signal.pair, signal.sign))
+        per_side.append(rows)
+    out: list[Disagreement] = []
+    for code in sorted(index, key=lambda c: index[c].ts):
+        a = sorted(per_side[0].get(code, []))
+        b = sorted(per_side[1].get(code, []))
+        if a == b:
+            continue
+        signal = index[code]
+        pairs = {p for p, _ in a} | {p for p, _ in b}
+        seen = {p: by_key[(code, p)] for p in pairs if (code, p) in by_key}
+        out.append(Disagreement(signal.title, signal.ts, code.split(":", 1)[0], a, b, seen))
+    return out
 
 
 def disagreements(
@@ -678,10 +938,12 @@ def disagreements(
 
 
 __all__ = [
-    "ArmSummary", "DEFAULT_LATENCY_S", "Disagreement", "LATENCIES", "Outcome",
-    "Signal", "Stat", "Tape", "TickTape", "TickTapes", "all_text_signals",
-    "bot_signals", "cost_usd", "disagreements", "keyword_bot", "latency_sweep",
+    "ArmSummary", "Confusion", "DEFAULT_LATENCY_S", "Disagreement", "LATENCIES",
+    "Outcome", "Signal", "Stat", "Tape", "TickTape", "TickTapes", "action_confusion",
+    "all_text_signals", "bill_surprise_signals", "bot_signals", "channel_counts",
+    "cost_usd", "decision_from_rates", "disagreements", "dots_surprise_signals",
+    "keyword_bot", "latency_sweep",
     "measure", "measure_ticks", "null_signals", "read_all", "reader_signals",
-    "reading_from_dict", "reading_to_dict", "state_hash", "summarize",
-    "surprise_bot", "surprise_signals",
+    "reading_from_dict", "reading_to_dict", "signal_disagreements", "state_hash",
+    "statements", "summarize", "surprise_bot", "surprise_signals",
 ]
