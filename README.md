@@ -898,13 +898,17 @@ edition becomes visible in a longer window is a different question and is read
 again), bodies per URL, tick hours per file as the compressed bytes they arrived
 as. An interrupted run re-reads what it has and fetches only what is missing.
 
-Fetching is the slow part and the model is not what makes it slow. One hour of
-ticks is one HTTPS request, a measured event needs about three of them, and the
-feed answers 503 to parallel connections from some networks — measured here: of
-eight concurrent requests six came back 503 or timed out, while the same eight
-run one at a time all succeeded, at ten to twenty-five seconds each. That is
-what the jittered retry is for, and it is why a seventeen-year run is meant to
-be started, watched in a log, and resumed rather than waited on.
+Fetching was the slow part until the connection was kept open. Measured here: a
+fresh TLS connection to the feed costs nine to sixteen seconds before the first
+byte, and the feed answers 503 when several are opened at once (six of eight
+concurrent requests failed; the same eight one at a time all succeeded), which
+capped the fetch at about five hour-files a minute. On a connection kept open
+the next request costs 0.2 s. So the fetch holds one persistent connection per
+worker (`--workers-io`; two to four is plenty), tunnelled through the proxy when
+one is configured, drops it on any transport error and reconnects on the next
+try. Of the roughly 15,000 hour files the 2009–2026 run needed, 20 stayed
+unreachable after five tries; a failure is reported and never cached, so the
+next invocation fetches only those.
 
 ### The run (real model, 60 days)
 
@@ -978,7 +982,87 @@ python -m jevtrade.cli fx --provider jev --tape dukascopy \
     --latency 1.0 --latency-sweep --out runs/fx-jev-fed-ticks.json
 ```
 
-The run has not been done yet; the numbers will go here when it has.
+Run on 2026-09-19: **2,187 documents** from 2009-01-06 to 2026-09-18 (858
+monetary-policy releases, of which 150 FOMC statements; 1,116 speeches; 213
+testimonies), 1,142 went to round two, 11 questions in the median document,
+**median 741 ms per document, p90 929 ms, $0.363 of input tokens, 476 s of wall
+time** for the reading with three workers. Graded on EURUSD ticks: entry on the
+first tick at or after the release plus one second, paying the ask to go long
+and the bid to go short, exit at the mid; null of the same side at random
+moments within five days where the tape has ticks. Events whose hours the feed
+never served are absent from the *traded* counts.
+
+```
+arm              signals traded    pre   rush  sprd      +1m      +5m     +15m     +30m     +60m  hit15    z15
+keyword-bot         1219   1149     -0     +0   0.6       +0       -0       -1       -1       -1    45%   -0.8
+  s.e.                                                   +-0      +-0      +-0      +-0      +-1
+reader >=0.15        240    225     +1     +0   0.8       +2       +1       +2       +2       +1    51%   +1.3
+  s.e.                                                   +-1      +-1      +-2      +-2      +-2
+  null                                                    -0       -0       -0       -1       -1
+all text            2187   2101     -0     +0   0.6       -0       -0       -1       -1       -1    46%   -1.7
+  s.e.                                                   +-0      +-0      +-0      +-0      +-0
+
+latency sweep (reader >=0.15, net of the half spread):
+   entry  traded   rush  sprd    +15m   s.e.    null     z    +60m   s.e.    null     z
+      0s     225     +0   0.8      +2      2      -0  +1.5      +1      2      -1  +1.0
+      1s     225     +0   0.8      +2      2      -0  +1.3      +1      2      -1  +1.0
+      5s     225     +1   0.8      +1      1      -0  +0.9      +0      2      -1  +0.6
+     30s     225     +2   0.6      +0      1      -0  +0.2      -1      2      -1  +0.2
+    120s     225     +2   0.5      +0      1      -0  +0.5      -0      2      -2  +0.5
+
+threshold sweep (+5m):  thr 0.05: 447 traded, +1 +-1   0.15: 225, +1 +-1   0.25: 109, +3 +-2   0.40: 39, +3 +-4
+```
+
+What seventeen years say, in the order they matter:
+
+- **Reading beats counting words, and neither is a trade.** The keyword bot's
+  1,149 trades come out at −1 ± 0 bp fifteen minutes on; its *hawkish* calls
+  lose outright, −1.5 ± 1.1 bp at fifteen minutes and −4.5 ± 1.7 at sixty over
+  207 trades, because "elevated" and "tightening" in a sentence are not a
+  hawkish sentence. The reader's 225 trades come out at **+2 ± 2 bp** with a hit
+  rate of 51% and z = +1.3 against its null. Two basis points with a standard
+  error of two is not a result anyone should size a book on. The all-text arm
+  at −1 bp (z −1.7) is the base rate: Fed text at large does not move EURUSD in
+  the direction the words point.
+- **Whatever is there is gone in thirty seconds.** The latency sweep is the
+  scalping question in one table: +2 bp entering at zero or one second, +1 at
+  five, **0 at thirty and at 120**, while the *rush* column — the mid's move
+  between the release and the entry, signed by the reader's side — climbs from
+  0 to +2 over the same range. The direction the model reads is the direction
+  the first half-minute goes, slightly more often than not, and after that
+  there is nothing left to collect. A 400 ms reader is inside that window; a
+  human is not. The spread at entry averages 0.8 bp, so the half-spread paid is
+  a fifth of the gross.
+- **It lives in the statements.** FOMC statements: 66 of 150 traded, +3.1 ± 4.2
+  bp at fifteen minutes and −3.5 ± 6.2 at sixty — the move mean-reverts. Speeches
+  and testimony: 119 traded, −0.1 ± 1.4 — nothing, and for a speech the
+  published timestamp is the scheduled start, not the moment a wire ran the
+  line, so nothing is the honest expectation. Dovish readings did better than
+  hawkish ones (+3.1 ± 2.2 over 130 against +0.2 ± 1.8 over 95). Split by era,
+  2009–2015 is −1.3 ± 4.4 (51 trades), **2016–2021 +6.1 ± 2.0 (82)**, 2022–2026
+  −0.2 ± 2.1 (92): one cell of three at three standard errors is what a post-hoc
+  split produces, not a regime, and it is reported so nobody has to find it.
+- **The big calls.** Right: 2009-03-18 (long, +136 bp at fifteen minutes, the
+  Treasury-purchase statement), 2020-03-23 (long, +61, unlimited purchases),
+  2016-12-14 (short, +55, the hike with the dots), 2019-01-30 (long, +46, the
+  "patient" pivot). Wrong: 2009-01-28 (long, −75), 2024-12-18 (long, −70, a cut
+  the market took as hawkish), 2022-11-02 (short, −66 at fifteen minutes and −2
+  at sixty, the statement read one way and the press conference the other). On
+  the largest statements the reader is right more often than not and wrong by
+  as much when it is wrong.
+- **What it read.** Neutral 1,349, dovish 550, hawkish 288. Speech or testimony
+  1,328, operational 305, minutes 287 (286 of them neutral), rate decision 195.
+  The intervention ladder never went above 0.47, on three speeches about
+  Treasury-market liquidity — the Fed does not talk about the dollar, and the
+  tree noticed.
+
+For the scalper who asked: reading central-bank text in under a second is worth
+about two basis points of EURUSD on the documents the reader chooses, captured
+inside thirty seconds of a scheduled release, with a standard error the same
+size as the edge, and mostly on FOMC statements. That is a measurement, not a
+strategy. What it rules out is the keyword bot; what it rules in is only that a
+400 ms reading points the right way for the first half-minute a little more
+often than not, at $0.36 for seventeen years of it.
 
 ### What this does not show
 
