@@ -1588,6 +1588,283 @@ the statement's words said — a pattern, not a reading — and the thing a read
 can still do here is what it did on the statements: read the facts right and
 abstain.
 
+### The wire: every headline a retail scalper sees
+
+Everything above is graded on **one issuer's scheduled text**, because the Fed
+archive was the only free source with minute timestamps and depth. That is not
+what a scalper reads. A scalper reads a wire: data prints from every country,
+every central bank's speakers, intervention talk, tariffs and politics,
+geopolitics, order-flow notes — eighty to five hundred and sixty items a week,
+all day. Asking whether reading central-bank text is worth two basis points
+answers a question about Fed statements, not a question about FX.
+
+**The source.** [investinglive.com](https://investinglive.com), formerly
+ForexLive, is the retail FX wire, and it publishes its whole archive as
+sitemaps. Probed 2026-09-21:
+
+| thing | what it is |
+|---|---|
+| `articles-sitemap-index.xml` | 946 weekly sitemaps, `/sitemaps/news/articles/{YYYY}-W{WW}.xml`, 2008-W33 to now |
+| a weekly sitemap | `<url><loc>…</loc><lastmod>2017-08-28T00:28:59+00:00</lastmod></url>` |
+| an article page | `<script type="application/ld+json">` with `@type: NewsArticle` |
+| its fields | `headline`, `alternativeHeadline`, `datePublished`, `dateModified`, `articleSection`, `keywords`, `genre`, `articleBody`, `text` |
+| `datePublished` | `2025-04-06T23:51:08.4325180Z` — UTC, to the second |
+| 2025 alone | 20,898 articles, 81 to 560 a week |
+
+`www.forexlive.com/sitemap.xml` redirects to the same index. URLs come in two
+shapes — `/news/!/japan-monetary-base-…-20170903` on the old site,
+`/news/…-20250406/` and `/central-banks/…`, `/commodities/…`, `/forex/…` on the
+new one — and both are just links to follow. `datetime.fromisoformat` refuses
+that timestamp (seven fractional digits), so `wire.py` parses it out rather
+than borrowing.
+
+That table is from a probe made **before** the `robots.txt` check below came
+back no. Nothing in it has been re-checked since, and nothing in it will be
+from here: the parsers are written to what it says, tested against fixtures,
+and left. The one line anybody should re-run is the robots check itself.
+
+#### The robots check came back no, and nothing was scraped
+
+`fx/wire.py` reads `robots.txt` before it fetches anything, and the answer
+decided this section. The file has a wildcard group that allows the articles
+and the sitemaps to any crawler — and then this:
+
+```
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+```
+
+…along with `AI2Bot`, `Bytespider`, `CCBot`, `DeepSeek`, `Baiduspider`,
+`Qwen-Agent`, `Amazonbot`, `meta-externalagent` and `Diffbot`. The site has
+said, by name, that it does not want AI agents crawling it.
+
+**So the 21,000-page collect was not run.** A bulk fetch driven by an agent,
+whose output is fed to a model, is the thing those three lines are about;
+sending a browser's `User-Agent` would evade the rule rather than satisfy it.
+The check is therefore written against *the work being done* and not against
+the header that would be sent: `wire.permission` takes the wildcard group **and**
+the AI-agent groups, and every one of them has to say yes.
+
+```
+robots.txt: articles DISALLOWED for ClaudeBot (Disallow: /); sitemaps DISALLOWED
+```
+
+`collect` raises `WireForbidden` rather than fetching, the CLI prints that line
+and exits 3, and a test pins the verdict to the real file so that a change on
+the site's side shows up as a failing test rather than as a silent scrape. The
+adapter is finished and exercised end to end offline; what it will not do is
+send the requests.
+
+There is one door and it does not go round the rule. If a cached corpus is
+already on disk — filled by somebody the wire *does* permit — the run continues
+in an **offline mode that fetches nothing at all**: cached weeks and cached
+articles are read, a link the cache has never held is counted in `uncached` and
+skipped, and no request reaches the host. A run that sends no requests needs no
+permission; a run that would send them does not get to borrow one.
+
+#### The judge: 1-minute candles, and the weekend that is not empty
+
+The tick judge is right and too expensive here: twenty-one thousand events on
+seven pairs, each needing a quarter of an hour before and an hour after, is
+dozens of hour-files apiece. The same feed publishes one file per pair per day
+per side of **1-minute candles** — 1,440 records, ~12 kB compressed — so a year
+of seven pairs both sides is 5,110 files instead of hundreds of thousands.
+
+```
+https://datafeed.dukascopy.com/datafeed/{SYMBOL}/{YYYY}/{MM}/{DD}/BID_candles_min_1.bi5
+                                                                 ASK_candles_min_1.bi5
+```
+
+`MM` is **zero-based**, exactly like the tick files, so the April 2025 file is
+`2025/03/02`. LZMA; decompressed it is consecutive 24-byte big-endian records,
+`struct.unpack(">IIIIIf")` = *(seconds since 00:00 UTC, open, close, low, high,
+volume)*, with prices scaled by 1e5 or by 1e3 for JPY. Verified on EURUSD
+2025-04-02 BID, whose first record is `(0, 107947, 107931, 107931, 107950,
+90.6)` → open 1.07947, and on USDJPY ASK → 149.757.
+
+**One thing about the format had to be found rather than assumed, and it is the
+kind that corrupts a study silently.** The hourly tick files answer an empty
+body for a closed hour. **The daily candle files do not: they pad.** Checked on
+2025-04-05, EURUSD, NZDUSD and USDCHF: the Saturday file is 1,440 records at
+Friday's closing price with **volume zero on both sides**. Friday's own file
+carries volume to 20:59 UTC and pads 21:00–23:59; Sunday pads until 21:00 and
+then has 180 real minutes. Taken at face value, a weekend "trade" returns a
+guaranteed 0 bp — which would quietly flatter every null — and a Friday-evening
++60m becomes a 51-hour return in disguise. So **a zero-volume minute is treated
+as no minute**: a bar the aggregated feed saw no trade in is not a price anyone
+could have transacted at, and dropping it reproduces the tick tape's weekend
+behaviour exactly. On real 2025 data that leaves Friday with 1,260 minutes,
+Saturday with none and Sunday with 180, and a Friday 20:30 signal at +60m comes
+back `None`. Over the whole year on EURUSD it leaves **372,088 tradeable
+minutes of the 525,600 records the feed serves**, with 52 days carrying none —
+so **29% of what those files contain is padding**, and a study that took them
+at face value would have graded almost a third of its nulls on it.
+
+**The entry rule, stated so the cost is visible.** A signal enters at the
+**open of the first bar whose start is at or after `posted + latency`**, pays
+the **ASK open to go long** and is filled at the **BID open to go short**, and
+exits at the **mid close** of the bar `h` minutes later. The latency therefore
+always rounds *up* to the next minute boundary, which means **0 s and 60 s are
+the same fill** except for a post stamped exactly on a boundary. The sweep is
+0 / 60 / 300 s for that reason and says so in its caption; only the five-minute
+row can honestly differ, and it is the question in the form somebody would ask
+it — *can a person who reads the headline and clicks still catch this?*
+
+Seven pairs: `EURUSD, USDJPY, GBPUSD, AUDUSD, USDCAD, USDCHF, NZDUSD`.
+
+#### The lateness caveat, which is the scope of the whole section
+
+This wire runs **seconds to minutes behind Reuters and Bloomberg**. Grading
+from its post time measures what a reader *of this wire* could have done, not
+what the event was worth. That is not a disclaimer to be taken on trust: every
+table carries a **`pre`** column — how far the pair moved in the fifteen minutes
+before the post, signed by the side the arm took — and that column *is* the
+lateness, measured. A cell with a large positive `pre` and a small forward
+return is the wire reporting a move that had already happened.
+
+#### The tree (`w1`)
+
+Its own version and its own cache tag, so no answer from `v1`, `ctx1` or `pc1`
+is ever reused for it. The state is the headline, the published time in UTC and
+in New York, London and Tokyo local, the section, the keywords and a body
+excerpt (`--body-chars`, default 3,000).
+
+**Round one, nine questions, one request, all speculative** — asked of every
+post including the ones that are obviously not about FX, because width is free
+and because the distribution of the answers is half the deliverable:
+
+| id | type | asks |
+|---|---|---|
+| `about_fx` | Noul | is this about a currency market at all — not crypto, not equities, not a chart level |
+| `currency` | Choice | `USD EUR JPY GBP AUD CAD CHF NZD CNY other none` — the one it most bears on |
+| `direction` | Choice | stronger / weaker / none, for that currency |
+| `category` | Choice | data release / central-bank decision / central-bank speaker / politics or trade / geopolitics / FX official or intervention / commentary or technical / order flow or positioning / other |
+| `magnitude` | Score | the same four levels as the other modes |
+| `new_information` | Noul | news, or a recap of something already out |
+| `scheduled` | Noul | on the calendar, or not |
+| `already_moved` | Noul | does the text itself say the market has already reacted |
+| `is_number` | Noul | a number against a forecast, rather than words |
+
+**Round two only if `about_fx` and `direction` are decisive** — which on a wire
+is most of the filter, since a day's eighty posts are mostly recaps, chart
+levels and crypto, and a second request on each of those would double the bill
+for nothing. It asks the reversed framing — *"a trader reading this wire at this
+moment: which side of {pair} for the next hour?"* — plus the holder check and the
+horizon. The side is asked about the **pair** and not the currency, so the model
+has to get from "the yen strengthens" to "short USDJPY" without being handed
+the mapping.
+
+The sign comes from `currency` + `direction` through one table with its own
+test, because getting it backwards inverts the study while leaving every number
+plausible:
+
+| answer | pair | side |
+|---|---|---|
+| USD stronger | `EURUSD` | short |
+| EUR stronger | `EURUSD` | long |
+| JPY stronger | `USDJPY` | short |
+| GBP stronger | `GBPUSD` | long |
+| AUD stronger | `AUDUSD` | long |
+| CAD stronger | `USDCAD` | short |
+| CHF stronger | `USDCHF` | short |
+| NZD stronger | `NZDUSD` | long |
+| CNY / other / none | — | no trade |
+
+Strength is arithmetic and the model multiplies nothing:
+`p(direction) × confirm × magnitude × new_information × (1 − already_moved)`.
+Unlike the absolute tree, `already_moved` is a **full** complement rather than a
+half damper — on a wire that runs behind the primary feeds, "the text says the
+market has already reacted" is a complete reason not to trade.
+
+Offline, `--provider mock` answers the same tree with `wire.py`'s lexicon — the
+*same* lexicon the `keyword-bot` arm uses — so the offline reader arm is that
+bot wearing the tree's clothes and should score like it. The gap between that
+and the real model on the same corpus is the result.
+
+#### The arms, and the breakdowns that are the point
+
+* **`reader >= thr`** — the `w1` tree at a strength threshold.
+* **`keyword-bot`** — the incumbent: a currency is named or its central bank is,
+  and hawkish/hike/beat/strong against dovish/cut/miss/weak sets the sign;
+  nothing otherwise. It cannot read: *"the RBA will not hike"* counts as a hike.
+* **`wire-sample`** — a seeded random sample (`--sample`, default 3,000) with the
+  keyword sign where it has one. This is the base rate — *did a post happen* —
+  without paying to grade all twenty-one thousand.
+* **`null`** — per arm, the same pair and side at random moments within five days
+  where the tape has bars, one per outcome.
+
+**One mean over twenty-one thousand posts is a number about the wire's mixture,
+not about anything tradeable.** So the deliverable is the split. Every
+breakdown carries n, hit rate, mean and standard error at +5 / +15 / +60, and
+the mean `pre`:
+
+* per `category` — which kind of post moves the tape;
+* per `scheduled` and per `is_number` — whether the thesis (numbers priced fast,
+  words slow) survives outside the Fed;
+* per currency and per pair;
+* per session — Asia 00–07, London 07–13, New York 13–21, late 21–24, UTC;
+* and **the reader's abstention rate per category**, which on a feed that is
+  mostly recaps is a result in itself.
+
+Plus the latency sweep at 0 / 60 / 300 s (with the note about minute bars
+above) and the usual list of posts where counting words and reading them traded
+differently, with the tape's own verdict next to both.
+
+```bash
+# scrape and cache the articles, print the summary, stop  (refused: see above)
+python -m jevtrade.cli fx --wire --since 2025-01-01 --until 2025-12-31 --collect-only
+
+# pre-fetch the seven pairs' BID/ASK day files for the window, stop
+python -m jevtrade.cli fx --wire --warm-candles --since 2025-01-01 --until 2025-12-31
+
+# the run
+python -m jevtrade.cli fx --wire --provider jev --since 2025-01-01 --until 2025-12-31 \
+    --horizons 1,5,15,30,60 --latency 1 --threshold 0.15 --sample 3000 \
+    --body-chars 3000 --out runs/fx-wire-2025.json
+```
+
+Both halves are resumable: articles are cached **as the extracted fields and
+never as the HTML** (21k pages of markup is about a gigabyte to keep a few
+hundred characters of each), day-files as the compressed bytes they arrived as,
+readings per post and tree version with the body budget in the key. An
+interrupted run re-reads what it has and fetches only what it never reached.
+
+**What a year would cost.** About 21,000 posts at roughly 700 input tokens each,
+times ~1.3 rounds — round two runs only on the decisive ones — is on the order
+of **$0.8 of input tokens**.
+
+**The candle side has been done.** 2025 is 5,110 day-files and all 5,110 are on
+disk: **53 minutes for 5,098 of them** with two keep-alive connections, then two
+more passes of two minutes and twelve seconds for the twelve the feed refused
+with a 503 or a read timeout — which is the resumability working, since a
+transient failure is reported and never cached. The feed's throughput swung by
+more than an order of magnitude inside that hour (0.1 to 2.5 files a second
+with the same two connections), so the right posture towards it is a background
+run and a second pass, not a longer timeout. 893 MB of compressed bytes on
+disk, and none of it needs fetching again.
+
+```
+5110/5110 day-files on disk, 0 unreachable
+  EURUSD 730/730   USDJPY 730/730   GBPUSD 730/730   AUDUSD 730/730
+  USDCAD 730/730   USDCHF 730/730   NZDUSD 730/730
+```
+
+**The run has not been done yet; the numbers will go here when it has.** The
+judge is warmed and the whole scoring path has been exercised against it — a
+synthetic corpus of sixty posts over the real April 2025 candles measures,
+places its nulls and fills every breakdown, at an average entry spread of 0.5
+to 0.8 bp. What is missing is the corpus, and it is missing on purpose: it
+cannot be collected from here without doing the thing the wire asked nobody to
+do. So what is finished is the adapter, the judge, the tree, the arms and the
+tests — and the honest note that the posts are waiting on permission rather
+than on code.
+
 ### What this does not show
 
 **Feed latency is the real bottleneck, and this study cannot measure it.** A
@@ -1635,13 +1912,16 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 396 tests
+python -m pytest -q      # 448 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
 accounting through a flip, the latency and deadline behaviour, the stop and
 kill switch, and two honesty checks on the simulator itself: no edge when
-`alpha=0`, and an edge when it is switched on.
+`alpha=0`, and an edge when it is switched on. Every feed parser is tested
+against a fixture rather than the network, including the wire's `robots.txt`
+itself — the verdict that section is gated on is pinned to the real file, so a
+change on the site's side fails a test instead of quietly starting a scrape.
 
 ## Layout
 
@@ -1681,10 +1961,14 @@ kill switch, and two honesty checks on the simulator itself: no edge when
 | `fx/baseline.py` | the word-counting bot and the rate-surprise bot |
 | `fx/tape.py` | spot FX bars, gap-aware entry and horizons |
 | `fx/ticks.py` | Dukascopy ticks: the book, the entry latency, the spread |
+| `fx/http.py` | one kept-open TLS connection per worker, shared by every FX fetch |
+| `fx/candles.py` | Dukascopy 1-minute candles: the cheap judge, and the padded weekend |
+| `fx/wire.py` | investinglive.com: the robots gate, the sitemaps, the JSON-LD |
 | `fx/context.py` | the pre-release context, every item stamped and checked |
 | `fx/dots.py` | the SEP histogram, the median, the rule and the forward register |
 | `fx/presser.py` | the press-conference transcript, split at the first question |
 | `fx/study.py` | the arms, the session-matched null, the audit |
+| `fx/wirestudy.py` | the wire's arms and the breakdowns that are its deliverable |
 | `fx/mock.py` | offline stub for the FX questions |
 
 TypeSafe also ships first-party SDKs (`pip install typesafe-sdk`,

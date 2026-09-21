@@ -15,7 +15,8 @@ trader be on", and "would a trader long this currency be unaffected" -- because
 two rephrasings of one question make partly independent errors, and that is the
 cheapest redundancy available. No second round, no trade.
 
-There are three modes. The **absolute** one is the tree above: read the text,
+There are three modes over a central bank's own text. The **absolute** one is
+the tree above: read the text,
 say which way it leans. The **context** one adds the question the absolute tree
 cannot ask -- *more hawkish than what?* -- because it is handed the pre-release
 context ``fx/context.py`` assembles and asks for the stance **relative** to it:
@@ -34,6 +35,14 @@ sign comes from ``presser_stance``, which is the conference as a whole and not
 the statement, so a day where the two disagree points the other way -- and the
 transcript is published after the fact, so that arm measures whether the words
 were worth hearing and not whether they could have been traded.
+
+A fourth tree at the bottom of this file reads something else entirely: a post
+on a retail FX **wire**, which is not one issuer's text but everything a
+scalper sees -- data prints, speakers from every central bank, intervention
+talk, tariffs, geopolitics, order flow. It has its own reader class because it
+reads an ``Article`` rather than a ``Document``, its own nine round-one
+questions, and its own version tag, so none of the three above ever share an
+answer with it.
 
 Sign convention, stated once and tested: **hawkish for the issuer's own currency
 means that currency strengthens.** Which way that pushes the *pair* depends on
@@ -57,10 +66,16 @@ CONTEXT_VERSION = "ctx1"
 # ... and so is the press-conference tree, which reads a document published half
 # an hour after the statement against the statement and the dots.
 PRESSER_VERSION = "pc1"
-ABSOLUTE, CONTEXT, PRESSER = "absolute", "context", "presser"
+# ... and so is the wire tree, which reads a retail FX headline rather than a
+# central bank's own text. It is deliberately **not** in ``MODES``: those are
+# the modes of the ``Reader`` below, which reads a ``Document``, and the wire
+# reads an ``Article``. It has its own reader class at the bottom of this file
+# and its own cache tag, so no answer of the other three is ever reused for it.
+WIRE_VERSION = "w1"
+ABSOLUTE, CONTEXT, PRESSER, WIRE = "absolute", "context", "presser", "wire"
 MODES = (ABSOLUTE, CONTEXT, PRESSER)
 TREE_VERSIONS = {ABSOLUTE: TREE_VERSION, CONTEXT: CONTEXT_VERSION,
-                 PRESSER: PRESSER_VERSION}
+                 PRESSER: PRESSER_VERSION, WIRE: WIRE_VERSION}
 
 
 def tree_version(mode: str = ABSOLUTE) -> str:
@@ -1058,6 +1073,447 @@ class Reader:
         )
 
 
+# --------------------------------------------------------------- the wire tree
+
+
+ABOUT_FX = "about_fx"
+CURRENCY = "currency"
+DIRECTION = "direction"
+CATEGORY = "category"
+SCHEDULED = "scheduled"
+ALREADY_MOVED = "already_moved"
+IS_NUMBER = "is_number"
+SIDE_OF_PAIR = "side_of_pair"
+
+STRONGER, WEAKER, NO_DIRECTION = "stronger", "weaker", "none"
+DIRECTIONS = (STRONGER, WEAKER, NO_DIRECTION)
+DIRECTION_SIGN = {STRONGER: +1, WEAKER: -1, NO_DIRECTION: 0}
+
+LONG_PAIR, SHORT_PAIR = "long_the_pair", "short_the_pair"
+
+DATA_RELEASE = "data_release"
+CB_DECISION = "central_bank_decision"
+CB_SPEAKER = "central_bank_speaker"
+POLITICS = "politics_or_trade"
+GEOPOLITICS = "geopolitics"
+FX_OFFICIAL = "fx_official_or_intervention"
+COMMENTARY = "market_commentary_or_technical"
+ORDERFLOW = "orderflow_or_positioning"
+OTHER_CATEGORY = "other"
+CATEGORIES = (
+    DATA_RELEASE, CB_DECISION, CB_SPEAKER, POLITICS, GEOPOLITICS,
+    FX_OFFICIAL, COMMENTARY, ORDERFLOW, OTHER_CATEGORY,
+)
+
+# Every currency the wire names often enough to trade, plus the three answers
+# that mean "no trade". ``CNY`` is offered because the wire talks about it every
+# day and the study would otherwise push those posts into ``other``, which would
+# hide them; there is no CNY pair in the judge, so it never trades.
+WIRE_CURRENCIES = (
+    "USD", "EUR", "JPY", "GBP", "AUD", "CAD", "CHF", "NZD", "CNY", "other", "none",
+)
+
+# Currency -> (Dukascopy symbol, +1 if that currency is the BASE of the pair).
+# This is the sign convention for the whole wire study, in one table with its
+# own test, because getting it backwards inverts the study while leaving every
+# number plausible. The rule is: a currency that strengthens moves its pair the
+# way its own side does. USD is the *quote* side of EURUSD, so a stronger
+# dollar is EURUSD down; JPY is the quote side of USDJPY, so a stronger yen is
+# USDJPY down; the dollar's own view of USDJPY is read through JPY's row with
+# the direction flipped, which is what a "USD stronger" answer on a yen story
+# would produce if the model picked USD as the currency.
+WIRE_PAIRS: dict[str, tuple[str, int]] = {
+    "USD": ("EURUSD", -1),   # USD stronger -> EURUSD down
+    "EUR": ("EURUSD", +1),
+    "JPY": ("USDJPY", -1),   # JPY stronger -> USDJPY down
+    "GBP": ("GBPUSD", +1),
+    "AUD": ("AUDUSD", +1),
+    "CAD": ("USDCAD", -1),   # CAD stronger -> USDCAD down
+    "CHF": ("USDCHF", -1),
+    "NZD": ("NZDUSD", +1),
+}
+
+
+def wire_signed_pair(currency: str, direction: str) -> tuple[str, int] | None:
+    """``(symbol, +1 long / -1 short)``, or None when there is nothing to trade.
+
+    ``CNY``, ``other``, ``none`` and a direction of ``none`` all return None:
+    the judge has seven pairs and inventing an eighth from a headline about the
+    yuan would be a hypothesis dressed as a measurement.
+    """
+    entry = WIRE_PAIRS.get(currency)
+    way = DIRECTION_SIGN.get(direction, 0)
+    if entry is None or way == 0:
+        return None
+    symbol, base = entry
+    return symbol, base * way
+
+
+def wire_strength(
+    p_direction: float,
+    confirm: float,
+    magnitude: float,
+    new_information: float,
+    already_moved: float,
+) -> float:
+    """Arithmetic on five probabilities; the model multiplies nothing.
+
+    ``already_moved`` enters as a full complement rather than the absolute
+    tree's half damper: on a wire that runs seconds behind the primary feeds,
+    "the text itself says the market has already reacted" is a complete reason
+    not to trade, and pretending otherwise is the error this whole study is
+    trying to measure rather than commit.
+    """
+    value = p_direction * confirm * magnitude * new_information * (1.0 - already_moved)
+    return max(0.0, min(1.0, value))
+
+
+def wire_questions() -> dict[str, dict[str, Any]]:
+    """Round one: nine questions about one headline, all speculative, one request.
+
+    Every one of them is asked of every post, including the ones that are
+    obviously not about FX, because width is free and because the *distribution*
+    of the answers is half the deliverable: how much of a retail FX wire is
+    commentary, how much is scheduled, how much is a number.
+    """
+    return {
+        ABOUT_FX: _noul(
+            "Is this post about a currency or the foreign exchange market at all?",
+            "It bears on the price of a currency: a central bank, an economy, a "
+            "policy, a flow, an official talking about the exchange rate.",
+            "It is about something else -- crypto, equities, a company, a "
+            "commodity on its own, or a chart level with no news in it.",
+        ),
+        CURRENCY: {
+            "type": "choice",
+            "instructions": (
+                "Which single currency does this post bear on most? Pick the one "
+                "whose price this news is about, not every currency it mentions."
+            ),
+            "criteria": {
+                "USD": "The US dollar: the Fed, US data, US politics, the dollar itself.",
+                "EUR": "The euro: the ECB, euro-area data or politics.",
+                "JPY": "The yen: the Bank of Japan, Japanese data, MoF or intervention talk.",
+                "GBP": "Sterling: the Bank of England, UK data, UK politics.",
+                "AUD": "The Australian dollar: the RBA, Australian data, China demand for it.",
+                "CAD": "The Canadian dollar: the Bank of Canada, Canadian data, oil for it.",
+                "CHF": "The Swiss franc: the SNB, Swiss data, a flight to safety.",
+                "NZD": "The New Zealand dollar: the RBNZ, New Zealand data.",
+                "CNY": "The Chinese yuan: the PBoC, the fix, Chinese data.",
+                "other": "A currency none of the above names.",
+                "none": "No currency in particular -- it is not about one.",
+            },
+        },
+        DIRECTION: {
+            "type": "choice",
+            "instructions": (
+                "Which way does this post cut for that currency, read at the "
+                "moment it was posted?"
+            ),
+            "criteria": {
+                STRONGER: "That currency should strengthen on this.",
+                WEAKER: "That currency should weaken on this.",
+                NO_DIRECTION: "Neither: it is two-sided, or there is no direction in it.",
+            },
+        },
+        CATEGORY: {
+            "type": "choice",
+            "instructions": "What kind of wire post is this?",
+            "criteria": {
+                DATA_RELEASE: (
+                    "An economic release: a number against a forecast -- CPI, "
+                    "payrolls, PMI, trade, a survey."
+                ),
+                CB_DECISION: (
+                    "A central bank's own decision or statement: a rate set or held, "
+                    "minutes, a projection, an operation."
+                ),
+                CB_SPEAKER: (
+                    "A central banker talking: a speech, a headline off one, an "
+                    "interview, testimony."
+                ),
+                POLITICS: (
+                    "Politics or trade policy: tariffs, budgets, elections, "
+                    "legislation, a leader on the economy."
+                ),
+                GEOPOLITICS: "War, sanctions, an attack, a diplomatic rupture, an energy shock.",
+                FX_OFFICIAL: (
+                    "An official on the exchange rate itself: verbal intervention, a "
+                    "rate check, an actual intervention, a fix."
+                ),
+                COMMENTARY: (
+                    "The wire's own commentary or a technical note: levels, support "
+                    "and resistance, a strategist's view, a preview or a wrap."
+                ),
+                ORDERFLOW: (
+                    "Order flow or positioning: option expiries, barriers, a bank's "
+                    "flow note, CFTC positioning, month-end rebalancing."
+                ),
+                OTHER_CATEGORY: "None of the above.",
+            },
+        },
+        MAGNITUDE: {
+            "type": "score",
+            "instructions": (
+                "How much would this post move the currency it is about, against "
+                "the dollar, in the hour after it was posted?"
+            ),
+            "criteria": list(MAGNITUDE_LEVELS),
+        },
+        NEW_INFORMATION: _noul(
+            "Is this news, or is it a recap of something already out?",
+            "It carries something that has just become known.",
+            "It recaps, previews, summarises or comments on something already public.",
+        ),
+        SCHEDULED: _noul(
+            "Was this on the calendar -- a release or a speech everyone knew was "
+            "coming at about this time?",
+            "A scheduled release, decision, speech or press conference.",
+            "Unscheduled: it happened, or somebody said it, without a time on it.",
+        ),
+        ALREADY_MOVED: _noul(
+            "Does the post itself say the market has already reacted?",
+            "The text reports a move that has already happened -- 'the dollar "
+            "jumped', 'yields are up', 'this is already priced'.",
+            "It reports the news without saying the market has moved on it.",
+        ),
+        IS_NUMBER: _noul(
+            "Is the news a number against a forecast, rather than words?",
+            "The substance is a printed figure and what was expected -- a beat, a "
+            "miss, a revision.",
+            "The substance is words: what somebody said, decided, or did.",
+        ),
+    }
+
+
+def wire_round_two_questions(pair: str, currency: str) -> dict[str, dict[str, Any]]:
+    """The reversed framing, the holder check and the horizon -- one more request.
+
+    The side is asked about the **pair** and not about the currency, which is the
+    reversal: round one said "the yen strengthens", round two has to say "short
+    USDJPY" without being handed the mapping. Two rephrasings of one question
+    make partly independent errors, and the product of the two is the confirm.
+    """
+    money = currency or "that currency"
+    symbol = pair or "the pair"
+    return {
+        HOLDER_UNAFFECTED: _noul(
+            f"Would a trader who is already long {money} have no reason to change "
+            "their position after reading this post?",
+            f"Nothing here changes the case for holding {money}.",
+            f"A {money} holder would want to act on this.",
+        ),
+        SIDE_OF_PAIR: {
+            "type": "choice",
+            "instructions": (
+                f"A trader reading this wire at this moment: which side of {symbol} "
+                "for the next hour?"
+            ),
+            "criteria": {
+                LONG_PAIR: f"Long {symbol}: buy the base currency against the quote one.",
+                SHORT_PAIR: f"Short {symbol}: sell the base currency against the quote one.",
+                NEITHER: "Neither side: there is nothing here to trade.",
+            },
+        },
+        HORIZON: {
+            "type": "choice",
+            "instructions": "Over what horizon would this post move the exchange rate?",
+            "criteria": {
+                MINUTES_H: "Minutes: it is priced almost at once and then done.",
+                HOURS_H: "Hours: it takes a session to be read and absorbed.",
+                DAYS_H: "Days or more: it changes the path, not the level.",
+            },
+        },
+    }
+
+
+def build_wire_state(
+    article: Any,
+    *,
+    round_no: int,
+    body_chars: int,
+    local: dict[str, str] | None = None,
+    so_far: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """What the reader sees: the headline, the clock, the filing and the body.
+
+    The three local times are in the state because a wire post is read
+    differently at 03:00 in London and 03:00 in Tokyo -- the same UTC minute is
+    the middle of the Tokyo session and the dead of the European night -- and
+    because "was this in a liquid session" is otherwise a fact the model has to
+    infer from a UTC hour.
+    """
+    times = local or {}
+    state: dict[str, Any] = {
+        "headline": getattr(article, "headline", ""),
+        "published_utc": article.when.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "published_local": {
+            "new_york": times.get("new_york", ""),
+            "london": times.get("london", ""),
+            "tokyo": times.get("tokyo", ""),
+        },
+        "section": getattr(article, "section", ""),
+        "keywords": list(getattr(article, "keywords", ()) or ())[:20],
+        "body": (getattr(article, "body", "") or "")[:body_chars],
+        "round": round_no,
+    }
+    if so_far:
+        state["first_round_verdicts"] = so_far
+    return state
+
+
+@dataclass
+class WireReading:
+    """One wire post, read. The counts are the deliverable as much as the trades."""
+
+    article: Any
+    about_fx: float
+    currency: str
+    p_currency: float
+    direction: str
+    p_direction: float
+    confidence: float
+    category: str
+    p_category: float
+    magnitude: float
+    new_information: float
+    scheduled: float
+    already_moved: float
+    is_number: float
+    confirm: float
+    horizon: str
+    verdict: Verdict | None
+    rounds: int
+    latency_ms: float
+    wall_ms: float
+    input_tokens: int
+    questions_asked: int = 0
+    responses: list[JevResponse] = field(default_factory=list, repr=False)
+
+    @property
+    def id(self) -> str:
+        return self.article.id
+
+    @property
+    def ts(self) -> float:
+        return self.article.published_ts
+
+    def signals(self, threshold: float, *, min_confidence: float = 0.5) -> list[Verdict]:
+        verdict = self.verdict
+        if verdict is None or verdict.sign == 0:
+            return []
+        if verdict.strength <= 0.0 or verdict.strength < threshold:
+            return []
+        if verdict.confidence < min_confidence:
+            return []
+        return [verdict]
+
+
+class WireReader:
+    """The ``w1`` tree: nine questions about a headline, three more if it is decisive.
+
+    Round two runs only when the post is **about FX at all** and the direction is
+    decisive, which on a wire is most of the filter: a day's 80 posts are mostly
+    recaps, technical levels and crypto, and a second request on each of those
+    would double the bill for nothing. What survives that gate is a post the
+    model says is about a currency and says which way it cuts.
+    """
+
+    def __init__(
+        self,
+        client,
+        *,
+        body_chars: int = 3000,
+        about_floor: float = 0.5,
+        direction_floor: float = 0.5,
+    ) -> None:
+        self.client = client
+        self.body_chars = body_chars
+        self.about_floor = about_floor
+        self.direction_floor = direction_floor
+        self.mode = WIRE
+
+    def _ask(self, questions: dict[str, Any], state: dict[str, Any]) -> JevResponse:
+        self.client.questions = questions
+        return self.client.evaluate(state)
+
+    def read(self, article: Any, *, local: dict[str, str] | None = None) -> WireReading:
+        started = time.perf_counter()
+        questions = wire_questions()
+        first = self._ask(
+            questions,
+            build_wire_state(article, round_no=1, body_chars=self.body_chars, local=local),
+        )
+        about = first.noul(ABOUT_FX).noul
+        currency = first.choice(CURRENCY)
+        direction = first.choice(DIRECTION)
+        category = first.choice(CATEGORY)
+        magnitude = first.score(MAGNITUDE).normalized
+        new_information = first.noul(NEW_INFORMATION).noul
+        scheduled = first.noul(SCHEDULED).noul
+        already_moved = first.noul(ALREADY_MOVED).noul
+        is_number = first.noul(IS_NUMBER).noul
+        responses = [first]
+        asked = len(questions)
+
+        signed = wire_signed_pair(currency.choice, direction.choice)
+        p_direction = direction.p(direction.choice)
+        confirm = 0.0
+        horizon = ""
+        decisive = (
+            about >= self.about_floor
+            and direction.choice != NO_DIRECTION
+            and p_direction >= self.direction_floor
+        )
+        if decisive and signed is not None:
+            symbol, sign = signed
+            so_far = {
+                "about_fx": round(about, 3),
+                "currency": currency.choice,
+                "direction": direction.choice,
+                "category": category.choice,
+                "scheduled": round(scheduled, 3),
+                "is_number": round(is_number, 3),
+            }
+            second_questions = wire_round_two_questions(symbol, currency.choice)
+            second = self._ask(
+                second_questions,
+                build_wire_state(article, round_no=2, body_chars=self.body_chars,
+                                 local=local, so_far=so_far),
+            )
+            responses.append(second)
+            asked += len(second_questions)
+            side = second.choice(SIDE_OF_PAIR)
+            want = LONG_PAIR if sign > 0 else SHORT_PAIR
+            confirm = (1.0 - second.noul(HOLDER_UNAFFECTED).noul) * side.p(want)
+            horizon = second.choice(HORIZON).choice
+
+        verdict: Verdict | None = None
+        if signed is not None:
+            symbol, sign = signed
+            verdict = Verdict(
+                pair=symbol, sign=sign, p_side=p_direction,
+                confidence=direction.confidence,
+                strength=wire_strength(p_direction, confirm, magnitude,
+                                       new_information, already_moved),
+            )
+
+        return WireReading(
+            article=article, about_fx=about,
+            currency=currency.choice, p_currency=currency.p(currency.choice),
+            direction=direction.choice, p_direction=p_direction,
+            confidence=direction.confidence,
+            category=category.choice, p_category=category.p(category.choice),
+            magnitude=magnitude, new_information=new_information, scheduled=scheduled,
+            already_moved=already_moved, is_number=is_number, confirm=confirm,
+            horizon=horizon, verdict=verdict, rounds=len(responses),
+            latency_ms=sum(r.latency_ms for r in responses),
+            wall_ms=(time.perf_counter() - started) * 1000.0,
+            input_tokens=sum(r.input_tokens for r in responses),
+            questions_asked=asked, responses=responses,
+        )
+
+
 __all__ = [
     "ABSOLUTE", "ACTIONS", "ACTION_RANK", "CHANNELS", "CONTEXT", "CONTEXT_VERSION",
     "DiffVerdict", "KINDS", "MAGNITUDE_LEVELS", "INTERVENTION_LEVELS", "MODES", "PAIRS",
@@ -1067,4 +1523,13 @@ __all__ = [
     "build_state", "context_questions", "context_strength", "pair_for",
     "presser_questions", "round_one_questions", "round_two_questions",
     "signed_pair", "strength", "tree_version",
+    # The wire tree.
+    "ABOUT_FX", "ALREADY_MOVED", "CATEGORIES", "CATEGORY", "CB_DECISION",
+    "CB_SPEAKER", "COMMENTARY", "CURRENCY", "DATA_RELEASE", "DIRECTION",
+    "DIRECTIONS", "DIRECTION_SIGN", "FX_OFFICIAL", "GEOPOLITICS", "IS_NUMBER",
+    "LONG_PAIR", "NO_DIRECTION", "ORDERFLOW", "OTHER_CATEGORY", "POLITICS",
+    "SCHEDULED", "SHORT_PAIR", "SIDE_OF_PAIR", "STRONGER", "WEAKER", "WIRE",
+    "WIRE_CURRENCIES", "WIRE_PAIRS", "WIRE_VERSION", "WireReader", "WireReading",
+    "build_wire_state", "wire_questions", "wire_round_two_questions",
+    "wire_signed_pair", "wire_strength",
 ]

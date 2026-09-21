@@ -51,24 +51,23 @@ import sys
 import threading
 import time
 import http.client
-import os
-import ssl
 import urllib.error
-import urllib.parse
-import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterable, NamedTuple, Sequence
 
 from ..listing.store import Store
+# The persistent-connection fetch now lives in ``http.py`` and is shared with
+# the wire and candle adapters. It is imported under its own names so that a
+# test which replaces ``ticks._get`` still replaces what ``fetch_bi5`` calls.
+from .http import UA, _connection, _drop_connection, _get
 from .reader import TICK_SYMBOLS
 
 FEED_URL = (
     "https://datafeed.dukascopy.com/datafeed/{symbol}"
     "/{year:04d}/{month:02d}/{day:02d}/{hour:02d}h_ticks.bi5"
 )
-UA = {"User-Agent": "Mozilla/5.0 (compatible; jev-trade research)"}
 
 RECORD = struct.Struct(">IIIff")
 RECORD_SIZE = RECORD.size  # 20
@@ -170,74 +169,6 @@ def decode_bi5(raw: bytes, scale: float, *, at: float = 0.0) -> list[Tick]:
             body[: len(body) - len(body) % RECORD_SIZE]
         )
     ]
-
-
-_local = threading.local()
-
-
-def _ssl_context() -> ssl.SSLContext:
-    cafile = (os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
-              or os.environ.get("CURL_CA_BUNDLE") or None)
-    return ssl.create_default_context(cafile=cafile)
-
-
-def _connection(host: str, timeout: float) -> http.client.HTTPSConnection:
-    """One persistent TLS connection per thread, tunnelled through the proxy if set.
-
-    Measured from this environment: the first request on a connection to the
-    feed costs 9-16 s (the handshake), every request after it about 0.2 s. A
-    fresh connection per file therefore caps the fetch at ~5 files a minute and
-    trips the feed's 503s under concurrency; one connection per worker, kept
-    open, does ~300 a minute.
-    """
-    conn = getattr(_local, "conn", None)
-    if conn is not None and getattr(_local, "host", None) == host:
-        conn.timeout = timeout
-        return conn
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-    if proxy:
-        parsed = urllib.parse.urlparse(proxy)
-        conn = http.client.HTTPSConnection(
-            parsed.hostname or "", parsed.port, timeout=timeout, context=_ssl_context(),
-        )
-        headers = {}
-        if parsed.username:
-            token = base64.b64encode(
-                f"{parsed.username}:{parsed.password or ''}".encode()
-            ).decode("ascii")
-            headers["Proxy-Authorization"] = f"Basic {token}"
-        conn.set_tunnel(host, 443, headers=headers)
-    else:
-        conn = http.client.HTTPSConnection(host, 443, timeout=timeout, context=_ssl_context())
-    _local.conn, _local.host = conn, host
-    return conn
-
-
-def _drop_connection() -> None:
-    conn = getattr(_local, "conn", None)
-    if conn is not None:
-        try:
-            conn.close()
-        finally:
-            _local.conn, _local.host = None, None
-
-
-def _get(url: str, timeout: float = 30.0) -> bytes:
-    """GET over the thread's persistent connection; ``HTTPError`` on a non-200."""
-    parts = urllib.parse.urlparse(url)
-    conn = _connection(parts.hostname or "", timeout)
-    try:
-        conn.request("GET", parts.path or "/", headers={**UA, "Connection": "keep-alive"})
-        response = conn.getresponse()
-        body = response.read()
-    except (http.client.HTTPException, OSError):
-        _drop_connection()
-        raise
-    if response.status != 200:
-        if not response.getheader("Connection", "").lower() == "keep-alive":
-            _drop_connection()
-        raise urllib.error.HTTPError(url, response.status, response.reason, response.headers, None)
-    return body
 
 
 def fetch_bi5(url: str, *, timeout: float = 30.0, tries: int = TRIES) -> bytes:
@@ -551,6 +482,9 @@ def has_ticks(
 
 
 __all__ = [
+    # Re-exported from ``http.py`` so that everything which used to reach for
+    # ``ticks._get`` -- including the tests that replace it -- still finds it here.
+    "UA", "_connection", "_drop_connection", "_get",
     "BACKOFF_S", "DEFAULT_LATENCY_S", "DEFAULT_SCALE", "FEED_URL", "HORIZONS",
     "JPY_SCALE",
     "LATENCIES", "MAX_HOURS", "PRE_MIN", "Quote", "STALE_S", "Tick",

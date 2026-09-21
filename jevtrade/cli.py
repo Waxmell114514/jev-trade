@@ -1577,8 +1577,316 @@ def cmd_fx_presser(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fx_wire(args: argparse.Namespace) -> int:
+    """Read the retail FX wire -- every headline a scalper sees -- on minute candles.
+
+    The central-bank study graded one issuer's scheduled text because the Fed
+    archive was the only free source with depth. This mode points the same kind
+    of tree at the stream a retail scalper actually reads: data prints, every
+    central bank's speakers, intervention talk, tariffs, geopolitics and order
+    flow, twenty thousand posts a year.
+
+    Two things are checked before anything is fetched. ``robots.txt``, which is
+    the wire's own statement of who may read it in bulk; and the caller's
+    intent, because ``--collect-only`` and ``--warm-candles`` are the two halves
+    of a run that takes tens of minutes each and are meant to be run apart.
+    """
+    import os
+    import statistics
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from .fx import candles as C
+    from .fx import reader as R
+    from .fx import study as S
+    from .fx import wire as W
+    from .fx import wirestudy as WS
+    from .fx.reader import WireReader
+    from .listing.store import Store
+
+    store = Store(args.cache)
+    horizons = tuple(int(h) for h in args.horizons.split(",") if h.strip())
+    report = tuple(h for h in WS.REPORT_HORIZONS if h in horizons) or horizons[:3]
+    now = time.time()
+    since = W.day_epoch(args.since) if args.since else now - args.days * 86400
+    until = W.day_epoch(args.until) + 86400 - 1 if args.until else now
+    if until <= since:
+        print("--until is not after --since", file=sys.stderr)
+        return 1
+
+    # The candle feed is a different host with a different robots.txt (it has
+    # none: 404, nothing disallowed), so warming it is never gated on the wire's.
+    if args.warm_candles:
+        print(f"warming {len(C.SYMBOLS)} pairs x 2 sides x "
+              f"{len(C.days_covering(since, until))} days of 1-minute candles")
+        warmth = C.warm(store, C.SYMBOLS, since, until, workers=max(1, min(args.workers_io, 2)))
+        print(warmth.summary())
+        for symbol, (have, want) in C.coverage(store, C.SYMBOLS, since, until).items():
+            print(f"  {symbol}: {have}/{want} files on disk")
+        return 0
+
+    # ---- who may read this wire, asked before anything is fetched
+    try:
+        verdict = W.check(store, "/news/")
+        index_verdict = W.check(store, "/articles-sitemap-index.xml")
+    except Exception as exc:  # noqa: BLE001 -- unreachable robots is not permission
+        print(f"{W.ROBOTS_URL}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print("robots.txt could not be read, which is not permission. Nothing fetched.")
+        return 3
+    print(f"robots.txt: articles {'allowed' if verdict.allowed else 'DISALLOWED'}"
+          f"{'' if verdict.allowed else ' for ' + verdict.blocked_by + ' (' + verdict.rule + ')'}"
+          f"; sitemaps {'allowed' if index_verdict.allowed else 'DISALLOWED'}")
+    offline = not (verdict.allowed and index_verdict.allowed)
+    if offline:
+        print("\nThe wire names AI agents in robots.txt and disallows them. This is an AI")
+        print("agent doing a bulk fetch, so the rule binds whatever User-Agent header it")
+        print("would send, and nothing will be fetched from it. --warm-candles still")
+        print("works: the price feed is a different host with no such rule.")
+        if not store.get("wire:index")[0]:
+            print("No cached corpus either, so there is nothing to read. Stopping.")
+            return 3
+        print("A cached corpus is present, so the run continues against it and sends no")
+        print("requests to the wire at all.")
+
+    # ---- the corpus
+    articles, coverage = W.collect(store, since, until, workers=min(args.workers_io, 4),
+                                   limit=args.limit, offline=offline)
+    print(coverage.summary())
+    if args.collect_only:
+        weeks = W.per_week(articles)
+        if weeks:
+            counts = sorted(weeks.values())
+            print(f"  {len(weeks)} ISO weeks, {counts[0]} to {counts[-1]} posts a week, "
+                  f"median {counts[len(counts) // 2]}")
+        return 0
+    if not articles:
+        print("no articles in range", file=sys.stderr)
+        return 1
+    print(f"{len(articles)} posts, {articles[0].when:%Y-%m-%d %H:%M} to "
+          f"{articles[-1].when:%Y-%m-%d %H:%M} UTC")
+
+    # ---- the reader
+    def make_reader() -> WireReader:
+        if args.provider == "mock" or (
+            args.provider == "auto" and not os.environ.get("TYPESAFE_API_KEY")
+        ):
+            from .fx.mock import MockWireClient
+
+            return WireReader(MockWireClient(), body_chars=args.body_chars)
+        return WireReader(resolve_client(args.provider, timeout_s=20.0),
+                          body_chars=args.body_chars)
+
+    provider = make_reader().client.provider
+    started = time.perf_counter()
+
+    def progress(done: int, total: int, round_two: int, cost: float) -> None:
+        print(f"  read {done}/{total}, {round_two} to round two, ${cost:.3f}, "
+              f"{time.perf_counter() - started:.0f}s", file=sys.stderr, flush=True)
+
+    readings = WS.read_all(
+        articles, make_reader, store=None if args.no_reading_cache else store,
+        cache_tag=f"{provider}:{R.WIRE_VERSION}", workers=args.workers,
+        body_chars=args.body_chars, progress=progress,
+    )
+    walls = sorted(r.wall_ms for r in readings)
+    print(
+        f"reader ({provider}, {R.WIRE_VERSION}): {len(readings)} posts, "
+        f"{sum(r.rounds == 2 for r in readings)} went to round two, "
+        f"median {statistics.median(walls):.0f} ms, "
+        f"${WS.cost_usd(readings):.3f} of input tokens, "
+        f"{time.perf_counter() - started:.0f}s wall"
+    )
+
+    # ---- the arms
+    tapes = C.MinuteTapes(store)
+    graded = dict(horizons=horizons, workers=args.workers_io, latency_s=args.latency)
+    arms: list[tuple[str, list[S.Signal], str]] = [
+        (f"reader >={args.threshold:.2f}", WS.reader_signals(readings, args.threshold),
+         "the w1 tree"),
+        ("keyword-bot", WS.keyword_signals(articles), "the wire's own lexicon, counted"),
+        ("wire-sample", WS.sample_signals(articles, args.sample),
+         f"a seeded sample of {args.sample}, keyword sign"),
+    ]
+    summaries: list[Any] = []
+    per_arm: list[list[Any]] = []
+    for name, signals, note in arms:
+        outcomes = WS.measure(tapes, signals, **graded)
+        nulls = WS.measure(tapes, WS.null_signals(tapes, outcomes, per=args.null_per,
+                                                  horizons=horizons, latency_s=args.latency,
+                                                  workers=args.workers_io), **graded)
+        summaries.append(S.summarize(name, signals, outcomes, nulls, horizons=horizons,
+                                    note=note, latency_s=args.latency))
+        per_arm.append(outcomes)
+
+    print(
+        f"\nSigned log return per signal, bps, entering at the OPEN of the first 1-minute"
+        f"\nbar starting at or after the post + {args.latency:g}s -- so the latency rounds up"
+        "\nto the next minute boundary. A long pays the ASK open, a short is filled at the"
+        "\nBID open, and the exit is the mid close. 'pre' is the 15 minutes BEFORE the post,"
+        "\nsigned by the side taken: that is the wire's lateness, measured. 'sprd' is the"
+        "\nspread at entry in bps. z is against the same pair and side at random moments"
+        "\nwithin 5 days where the tape has bars, at the same latency."
+    )
+    hz = "".join(f"{'+' + str(h) + 'm':>9}" for h in horizons)
+    print(f"\n{'arm':<22}{'signals':>8}{'traded':>7}{'pre':>7}{'sprd':>6}{hz}"
+          f"{'hit15':>7}{'z15':>7}")
+    print("-" * (22 + 8 + 7 + 13 + 9 * len(horizons) + 14))
+    for s_row in summaries:
+        cells = "".join(f"{s_row.fwd[h].mean:>+9.0f}" for h in horizons)
+        tail = (f"{s_row.hit.get(15, 0.0):>7.0%}{s_row.z.get(15, 0.0):>+7.1f}"
+                if s_row.measured else f"{'-':>7}{'-':>7}")
+        print(f"{s_row.name:<22}{s_row.signals:>8}{s_row.measured:>7}"
+              f"{s_row.pre.mean:>+7.0f}{s_row.spread.mean:>6.1f}{cells}{tail}")
+        blank = " " * 13
+        errs = "".join(f"{'+-' + format(s_row.fwd[h].se, '.0f'):>9}" for h in horizons)
+        null = "".join(f"{s_row.null[h].mean:>+9.0f}" for h in horizons)
+        mid = "".join(f"{s_row.fwd_mid[h].mean:>+9.0f}" for h in horizons)
+        print(f"{'  s.e.':<22}{'':>8}{'':>7}{blank}{errs}")
+        print(f"{'  null':<22}{'':>8}{'':>7}{blank}{null}")
+        print(f"{'  no spread':<22}{'':>8}{'':>7}{blank}{mid}")
+        if s_row.note:
+            print(f"  ({s_row.note})")
+
+    reader_outcomes = per_arm[0]
+    print("\nwhat the reader made of the wire:")
+    for field_name in ("category", "currency", "direction"):
+        print(f"  {field_name}: " + ", ".join(
+            f"{k} {v}" for k, v in WS.answer_counts(readings, field_name).items()))
+
+    print(f"\nwhere the reader stayed out (>= {args.threshold:.2f} to trade):")
+    print(f"{'category':<27}{'read':>7}{'traded':>8}{'abstained':>11}")
+    for row in WS.abstentions(readings, args.threshold):
+        print(f"{row.category[:26]:<27}{row.read:>7}{row.traded:>8}{row.rate:>11.0%}")
+
+    tables: list[tuple[str, list[Any]]] = []
+    for title, key in (
+        ("reader, by category", WS.by_reading(reader_outcomes, readings, "category")),
+        ("reader, by currency", WS.by_reading(reader_outcomes, readings, "currency")),
+        ("reader, scheduled", WS.by_reading(reader_outcomes, readings, "scheduled")),
+        ("reader, is_number", WS.by_reading(reader_outcomes, readings, "is_number")),
+        ("reader, by session (UTC)", WS.by_session),
+        ("reader, by pair", WS.by_pair),
+    ):
+        rows = WS.breakdown(reader_outcomes, key, horizons=report)
+        tables.append((title, rows))
+    for title, key in (
+        ("keyword-bot, by session (UTC)", WS.by_session),
+        ("keyword-bot, by pair", WS.by_pair),
+    ):
+        tables.append((title, WS.breakdown(per_arm[1], key, horizons=report)))
+    tables.append(("wire-sample, by session (UTC)",
+                   WS.breakdown(per_arm[2], WS.by_session, horizons=report)))
+    for title, rows in tables:
+        print(f"\n{title}:")
+        print(WS.header(report))
+        for row in rows[: max(args.show, 10)]:
+            print(row.row(report))
+
+    sweep: list[Any] = []
+    swept = arms[0][1] if len(arms[0][1]) >= 5 else arms[1][1]
+    sweep_h = tuple(h for h in (15, 60) if h in horizons) or (horizons[-1],)
+    sweep = WS.latency_sweep(tapes, swept, horizons=sweep_h, per=args.null_per,
+                             workers=args.workers_io)
+    print(f"\nlatency sweep ({len(swept)} signals). On minute bars 0s and 60s are the same")
+    print("fill except for a post stamped exactly on a boundary; only the 300s row can differ:")
+    cols = "".join(f"{'+' + str(h) + 'm':>8}{'s.e.':>7}{'null':>8}{'z':>6}" for h in sweep_h)
+    print(f"{'entry':>8}{'traded':>8}{'sprd':>6}{cols}")
+    for row in sweep:
+        cells = "".join(
+            f"{row.fwd[h].mean:>+8.0f}{row.fwd[h].se:>7.0f}"
+            f"{row.null[h].mean:>+8.0f}{row.z[h]:>+6.1f}" for h in sweep_h)
+        print(f"{format(row.latency_s, 'g') + 's':>8}{row.measured:>8}"
+              f"{row.spread.mean:>6.1f}{cells}")
+
+    # Left becomes ``.bot`` and right becomes ``.reader`` on a ``Disagreement``,
+    # so the keyword bot goes first here exactly as it does in --context.
+    diffs = S.signal_disagreements(arms[1][1], arms[0][1],
+                                   reader_outcomes + per_arm[1],
+                                   horizon=report[min(1, len(report) - 1)])
+    diffs.sort(key=lambda d: -max([abs(v) for v in d.outcomes.values()] or [0.0]))
+    print(f"\nwhere counting words and reading them traded differently "
+          f"({len(diffs)} of {len(readings)}):")
+    for d in diffs[: args.show]:
+        when = datetime.fromtimestamp(d.when, timezone.utc)
+        fmt = lambda rows: ", ".join(  # noqa: E731
+            f"{'long' if s > 0 else 'short'} {p}" for p, s in rows) or "nothing"
+        moves = ", ".join(f"{p} {v:+.0f}" for p, v in d.outcomes.items()) or "no tape"
+        print(f"  {when:%Y-%m-%d %H:%M} {d.title[:66]}")
+        print(f"      bot: {fmt(d.bot)[:70]}")
+        print(f"   reader: {fmt(d.reader)[:70]}")
+        print(f"     tape: {moves[:70]}")
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        def outcome_row(o: Any) -> dict[str, Any]:
+            return {
+                "ts": o.signal.ts, "code": o.signal.code, "title": o.signal.title,
+                "pair": o.signal.pair, "side": o.signal.sign,
+                "strength": o.signal.strength, "pre_bps": o.pre_bps,
+                "spread_bps": o.spread_bps, "latency_s": o.latency_s,
+                "entry_ts": o.entry_ts, "session": W.sessions(o.signal.ts),
+                "fwd_bps": {h: o.fwd_bps.get(h) for h in horizons},
+                "fwd_mid_bps": {h: o.fwd_mid_bps.get(h) for h in horizons},
+            }
+
+        def cell_row(c: Any) -> dict[str, Any]:
+            return {"key": c.key, "n": c.n, "pre": asdict(c.pre), "hit": c.hit,
+                    "fwd": {h: asdict(v) for h, v in c.fwd.items()}}
+
+        out.write_text(json.dumps({
+            "mode": "wire", "tree": R.WIRE_VERSION, "provider": provider,
+            "since": since, "until": until, "tape": "dukascopy-1m",
+            "latency_s": args.latency, "threshold": args.threshold,
+            "horizons": list(horizons), "body_chars": args.body_chars,
+            "sample": args.sample,
+            "robots": {"articles_allowed": verdict.allowed,
+                       "blocked_by": verdict.blocked_by, "rule": verdict.rule},
+            "coverage": asdict(coverage),
+            "arms": [
+                {"name": s.name, "signals": s.signals, "measured": s.measured,
+                 "note": s.note, "pre": asdict(s.pre), "spread": asdict(s.spread),
+                 "fwd": {h: asdict(v) for h, v in s.fwd.items()},
+                 "fwd_mid": {h: asdict(v) for h, v in s.fwd_mid.items()},
+                 "null": {h: asdict(v) for h, v in s.null.items()},
+                 "hit": s.hit, "z": s.z,
+                 "outcomes": [outcome_row(o) for o in outcomes]}
+                for s, outcomes in zip(summaries, per_arm)
+            ],
+            "breakdowns": [
+                {"table": title, "horizons": list(report),
+                 "rows": [cell_row(c) for c in rows]}
+                for title, rows in tables
+            ],
+            "abstention": [
+                {"category": a.category, "read": a.read, "traded": a.traded,
+                 "rate": a.rate}
+                for a in WS.abstentions(readings, args.threshold)
+            ],
+            "latency_sweep": [
+                {"latency_s": r.latency_s, "measured": r.measured,
+                 "spread": asdict(r.spread),
+                 "fwd": {h: asdict(v) for h, v in r.fwd.items()},
+                 "null": {h: asdict(v) for h, v in r.null.items()}, "z": r.z}
+                for r in sweep
+            ],
+            "readings": [
+                {"id": r.id, "ts": r.ts, "url": r.article.url,
+                 "headline": r.article.headline, "section": r.article.section,
+                 **WS.reading_to_dict(r)}
+                for r in readings
+            ],
+        }, ensure_ascii=False, indent=1))
+        print(f"\nwrote {out}")
+    return 0
+
+
 def cmd_fx(args: argparse.Namespace) -> int:
     """Read central-bank text in one second; let the spot tape grade every arm."""
+    if args.wire:
+        return cmd_fx_wire(args)
     if args.dots:
         return cmd_fx_dots(args)
     if args.presser:
@@ -2019,6 +2327,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="character budget for the assembled context block")
     fx.add_argument("--snapshot-calendar", action="store_true",
                     help="store this week's calendar so the surprise arm can run later")
+    fx.add_argument("--wire", action="store_true",
+                    help="read investinglive.com's FX wire, graded on 1-minute candles")
+    fx.add_argument("--collect-only", action="store_true",
+                    help="--wire: scrape and cache the articles, print the summary, stop")
+    fx.add_argument("--warm-candles", action="store_true",
+                    help="--wire: pre-fetch the seven pairs' BID/ASK day files, stop")
+    fx.add_argument("--sample", type=int, default=3000,
+                    help="--wire: posts in the seeded base-rate sample")
+    fx.add_argument("--body-chars", type=int, default=3000,
+                    help="--wire: article body characters the reader is shown")
     fx.add_argument("--out", default="", help="write a JSON record of the run")
     fx.set_defaults(func=cmd_fx)
 

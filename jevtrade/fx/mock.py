@@ -33,6 +33,7 @@ from typing import Any
 
 from ..types import ChoiceAnswer, JevResponse, NoulAnswer, ScoreAnswer
 from . import reader as R
+from . import wire as W
 
 HAWKISH_WORDS = re.compile(
     r"\b(raise[sd]?|raising|hike[sd]?|tighten\w*|restrictive|elevated|"
@@ -344,8 +345,104 @@ def _score(level: float, levels: list[str]) -> ScoreAnswer:
     )
 
 
+class MockWireClient:
+    """Offline stand-in for Jev on the ``w1`` wire tree, and a rule to the bone.
+
+    It reads the headline and the body with ``wire.py``'s lexicon -- the *same*
+    lexicon the ``keyword-bot`` arm uses -- so the offline reader arm is that
+    bot wearing the tree's clothes, and it should score like it. That is the
+    point: the gap between this and the real model on the same 21,000 posts is
+    the result, and if the offline arm ever beat the bot the test harness would
+    be measuring itself.
+
+    It cannot read. "The RBA will not hike" counts as hawkish, a technical piece
+    about support at 1.0800 has no direction, and anything with bitcoin in it is
+    not about FX. All three are wrong in ways a model should not be, and all
+    three are deterministic, so a cached run and a fresh one agree.
+    """
+
+    provider = "mock"
+
+    def __init__(self, model: str = "mock-keyword", **_ignored: Any) -> None:
+        self.model = model
+        self.questions: dict[str, Any] | None = None
+        self.calls = 0
+
+    def evaluate(self, state: dict[str, Any]) -> JevResponse:
+        self.calls += 1
+        headline = str(state.get("headline", ""))
+        body = str(state.get("body", ""))
+        keywords = " ".join(str(k) for k in (state.get("keywords") or []))
+        text = f"{headline}\n{keywords}\n{body}"
+        currency = W.currency_of(text)
+        direction = W.direction_of(text)
+        category = W.category_of(text)
+        about = W.about_fx_of(text)
+        # How lopsided the word count was, which is all the confidence a rule
+        # has any business claiming.
+        up = len(W.HAWKISH_WIRE.findall(text))
+        down = len(W.DOVISH_WIRE.findall(text))
+        lopsided = abs(up - down) / (up + down) if (up + down) else 0.0
+        signed = R.wire_signed_pair(currency, direction)
+        want = R.NEITHER
+        if signed is not None:
+            want = R.LONG_PAIR if signed[1] > 0 else R.SHORT_PAIR
+        # A rule's idea of how big the news is: a decision or a print is the
+        # day, a speaker is an hour, commentary is nothing.
+        level = {R.CB_DECISION: 2.6, R.DATA_RELEASE: 2.4, R.FX_OFFICIAL: 2.2,
+                 R.CB_SPEAKER: 1.6, R.GEOPOLITICS: 1.6, R.POLITICS: 1.4,
+                 R.ORDERFLOW: 0.8}.get(category, 0.4)
+
+        answers: dict[str, Any] = {}
+        for key, question in (self.questions or {}).items():
+            options = list(question["criteria"])
+            if key == R.ABOUT_FX:
+                answers[key] = NoulAnswer(noul=0.8 if about else 0.15)
+            elif key == R.CURRENCY:
+                answers[key] = _choice(currency, options, 0.6 if about else 0.4)
+            elif key == R.DIRECTION:
+                answers[key] = _choice(direction, options, 0.4 + 0.5 * lopsided)
+            elif key == R.CATEGORY:
+                answers[key] = _choice(category, options, 0.55)
+            elif key == R.SIDE_OF_PAIR:
+                answers[key] = _choice(want, options, 0.4 + 0.5 * lopsided)
+            elif key == R.MAGNITUDE:
+                answers[key] = _score(level, options)
+            elif key == R.NEW_INFORMATION:
+                answers[key] = NoulAnswer(
+                    noul=0.3 if category == R.COMMENTARY else 0.7)
+            elif key == R.SCHEDULED:
+                answers[key] = NoulAnswer(
+                    noul=0.8 if W.SCHEDULED_WIRE.search(text) else 0.2)
+            elif key == R.ALREADY_MOVED:
+                answers[key] = NoulAnswer(
+                    noul=0.75 if W.ALREADY_MOVED_WIRE.search(text) else 0.15)
+            elif key == R.IS_NUMBER:
+                answers[key] = NoulAnswer(
+                    noul=0.8 if W.NUMBER_WIRE.search(text) else 0.15)
+            elif key == R.HOLDER_UNAFFECTED:
+                answers[key] = NoulAnswer(noul=max(0.05, 0.8 - 0.7 * lopsided))
+            elif key == R.HORIZON:
+                answers[key] = _choice(
+                    R.HOURS_H if category in (R.CB_DECISION, R.DATA_RELEASE)
+                    else R.MINUTES_H, options, 0.6)
+            elif question["type"] == "noul":
+                answers[key] = NoulAnswer(noul=0.2)
+            elif question["type"] == "choice":
+                answers[key] = _choice(options[0], options, 0.5)
+            else:
+                answers[key] = _score(0.0, options)
+
+        return JevResponse(
+            model=self.model, answers=answers,
+            input_tokens=len(str(state)) // 4, output_tokens=0,
+            latency_ms=1.0, provider=self.provider,
+        )
+
+
 __all__ = [
-    "DOVISH_WORDS", "HAWKISH_WORDS", "MockFxClient", "actual_action",
+    "DOVISH_WORDS", "HAWKISH_WORDS", "MockFxClient", "MockWireClient",
+    "actual_action",
     "dominant_topic", "expected_action", "relative_stance", "surprise_channel",
     "versus",
 ]

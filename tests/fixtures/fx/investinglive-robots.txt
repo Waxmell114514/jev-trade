@@ -1,0 +1,55 @@
+# Global Rules for All Bots
+User-agent: *
+Disallow: /search-results
+Disallow: /terms/search-results
+Disallow: /tag/search-results
+Disallow: /signalr/
+Disallow: /*.pdf$
+
+# Bot-Specific Restrictions
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+
+User-agent: AI2Bot
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: Diffbot
+Disallow: /
+
+User-agent: DeepSeekBot
+Disallow: /
+
+User-agent: DeepSeek
+Disallow: /
+
+User-agent: Baiduspider
+Disallow: /
+
+User-agent: Qwen-Agent
+Disallow: /
+
+User-agent: Amazonbot
+Disallow: /
+
+User-agent: meta-externalagent
+Disallow: /
+
+User-agent: SemrushBot
+Disallow: /
+
+# Sitemap Directives
+Sitemap: https://investinglive.com/sitemap.xml
+Sitemap: https://investinglive.com/latest.xml
+Sitemap: https://investinglive.com/articles-sitemap-index.xml

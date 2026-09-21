@@ -30,6 +30,16 @@ What is measured here and what is assumed:
   first bar *after* the timestamp, which on 5-minute bars is up to five minutes
   late, on purpose.
 
+The same tree is also pointed at a retail FX **wire**, where the stream is not
+one issuer's scheduled text but everything a scalper reads: data prints from
+every country, every central bank's speakers, intervention talk, tariffs,
+geopolitics and order flow. That mode is graded on 1-minute candles rather than
+ticks, because twenty thousand posts a year is a different budget, and it
+carries one more caveat of its own: a wire runs behind the primary feeds, so
+its post time is not the event's time. The ``pre`` column measures that gap
+instead of assuming it away. Nothing is fetched from that source until its own
+``robots.txt`` has been read and has said yes.
+
 Every number is arithmetic on the model's probabilities. The model is never
 asked to compute one.
 """
