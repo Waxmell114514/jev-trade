@@ -497,7 +497,10 @@ class Article:
     section: str = ""
     keywords: tuple[str, ...] = ()
     body: str = ""
-    source: str = "json-ld"  # or "meta": the fallback, counted separately
+    source: str = "json-ld"  # or "meta" (the fallback) or "posts-file" (an import)
+    # The id this post carries in whatever archive it came from, when it came
+    # from one rather than from a URL. Empty for everything the wire fetched.
+    source_id: str = ""
 
     @property
     def when(self) -> datetime:
@@ -505,7 +508,8 @@ class Article:
 
     @property
     def id(self) -> str:
-        tail = re.sub(r"[^A-Za-z0-9]+", "-", self.url.rstrip("/").rsplit("/", 1)[-1])[:60]
+        tail = self.source_id or re.sub(
+            r"[^A-Za-z0-9]+", "-", self.url.rstrip("/").rsplit("/", 1)[-1])[:60]
         return f"wire:{int(self.published_ts)}:{tail}"
 
 
@@ -552,6 +556,7 @@ def _to_dict(article: Article) -> dict[str, Any]:
         "url": article.url, "ts": article.published_ts, "headline": article.headline,
         "section": article.section, "keywords": list(article.keywords),
         "body": article.body[:CACHE_BODY_CHARS], "source": article.source,
+        "source_id": article.source_id,
     }
 
 
@@ -562,6 +567,7 @@ def _from_dict(data: dict[str, Any]) -> Article:
         keywords=tuple(data.get("keywords") or ()),
         body=str(data.get("body") or "")[:CACHE_BODY_CHARS],
         source=str(data.get("source", "json-ld")),
+        source_id=str(data.get("source_id", "")),
     )
 
 
@@ -780,7 +786,8 @@ CURRENCY_WORDS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("JPY", re.compile(r"(?i)\byen\b|\bjpy\b|bank of japan|\bboj\b|\bueda\b|"
                        r"japan(ese)?\b|\bmof\b|usd/?jpy")),
     ("EUR", re.compile(r"(?i)\beuro\b|\beur\b|\becb\b|lagarde|euro ?zone|euro ?area|"
-                       r"germany|german|france|french|italy|eur/?usd")),
+                       r"germany|german|france|french|italy|eur/?usd|"
+                       r"europe\w*|european union|\bEU\b")),
     ("GBP", re.compile(r"(?i)sterling|\bgbp\b|\bpound\b|bank of england|\bboe\b|"
                        r"bailey|\buk\b|britain|british|gbp/?usd")),
     ("AUD", re.compile(r"(?i)\baud\b|aussie|australia|\brba\b|bullock|aud/?usd")),
@@ -789,20 +796,30 @@ CURRENCY_WORDS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
                        r"macklem|usd/?cad")),
     ("CHF", re.compile(r"(?i)\bchf\b|\bfranc\b|swiss|switzerland|\bsnb\b|usd/?chf")),
     ("CNY", re.compile(r"(?i)\bcny\b|\bcnh\b|\byuan\b|renminbi|\bpboc\b|china|chinese")),
+    # No MXN pair in the judge, so a Mexico post is classified honestly and
+    # never traded -- which is better than letting it fall through to USD on
+    # the word "tariffs" and trading the dollar on somebody else's story.
+    ("MXN", re.compile(r"(?i)\bmxn\b|\bpeso\b|mexico|mexican")),
     ("USD", re.compile(r"(?i)\bdollar\b|\busd\b|\bfed\b|\bfomc\b|powell|federal reserve|"
-                       r"united states|\bus\b|\bu\.s\.|greenback|treasury")),
+                       r"united states|\bus\b|\bu\.s\.|greenback|treasury|"
+                       r"\bjerome\b|interest rates?")),
 )
 
 HAWKISH_WIRE = re.compile(
     r"(?i)\bhawkish\b|\bhike[sd]?\b|\bhiking\b|\braise[sd]? rates\b|\btighten\w*|"
-    r"\bbeat[s]?\b|\bstronger\b|\bstrong\b|\bhigher than (expected|forecast)|"
+    r"\bbeat[s]?\b|\bstrong(er|est)?\b|\bhigher than (expected|forecast)|"
     r"\btops? (forecast|estimate)|\bupside surprise|\bjumps?\b|\bsurges?\b|"
     r"\baccelerat\w*|\brebound\w*|\bhotter\b")
 DOVISH_WIRE = re.compile(
     r"(?i)\bdovish\b|\bcut[s]?\b|\bcutting\b|\blower rates\b|\bease?[sd]?\b|"
-    r"\beasing\b|\bmiss(es|ed)?\b|\bweaker\b|\bweak\b|\blower than (expected|forecast)|"
+    r"\beasing\b|\bmiss(es|ed)?\b|\bweak(er|est)?\b|\blower than (expected|forecast)|"
     r"\bbelow (forecast|estimate)|\bdownside surprise|\bfalls?\b|\bslumps?\b|"
-    r"\bslow(s|ed|ing|down)?\b|\bcooler\b|\bcontract\w*")
+    r"\bslow(s|ed|ing|down)?\b|\bcooler\b|\bcontract\w*|"
+    # Written for a corpus that demands cuts rather than reporting them: a post
+    # pressing for lower rates is dovish for the currency by the same rule that
+    # makes a cut dovish. Whether the pressure works is not the bot's claim.
+    r"\btoo late\b|rates?,? (are|is) too high|must (be )?(cut|lower\w*)|"
+    r"should (be )?(cut|lower\w*)")
 
 # Posts that are not about a currency at all, which on this wire is a real
 # fraction of the feed: it also covers crypto, equities and chart levels.
@@ -817,10 +834,12 @@ CATEGORY_WORDS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
                 r"\bfix\b|verbal intervention")),
     ("central_bank_decision",
      re.compile(r"(?i)rate decision|policy decision|minutes|statement|holds? rates|"
-                r"leaves? rates|raises? rates|cuts? rates|\bsep\b|projections")),
+                r"leaves? rates|raises? rates|cuts? rates|lower rates?|"
+                r"\bsep\b|projections|"
+                r"interest rates?|federal reserve|\bthe fed\b")),
     ("central_bank_speaker",
      re.compile(r"(?i)\bspeech\b|speaks|says|comments|testimony|press conference|"
-                r"powell|lagarde|bailey|ueda|macklem|bullock")),
+                r"powell|lagarde|bailey|ueda|macklem|bullock|\bjerome\b")),
     ("data_release",
      re.compile(r"(?i)\bcpi\b|\bppi\b|\bpmi\b|payrolls|\bgdp\b|unemployment|"
                 r"retail sales|trade balance|inflation rate|\bifo\b|\bzew\b|"

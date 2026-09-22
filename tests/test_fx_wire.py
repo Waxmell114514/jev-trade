@@ -229,7 +229,8 @@ def test_an_article_is_cached_as_its_fields_and_never_as_the_html(tmp_path):
     assert calls == [url]
     assert first == second
     stored = store.get(f"wire:article:{url}")[1]
-    assert set(stored) == {"url", "ts", "headline", "section", "keywords", "body", "source"}
+    assert set(stored) == {"url", "ts", "headline", "section", "keywords", "body",
+                           "source", "source_id"}
     assert "<script" not in "".join(
         path.read_text() for path in Path(tmp_path).glob("*.json"))
 

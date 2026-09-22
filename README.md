@@ -1865,6 +1865,98 @@ do. So what is finished is the adapter, the judge, the tree, the arms and the
 tests — and the honest note that the posts are waiting on permission rather
 than on code.
 
+#### A corpus the user brought: Truth Social, 2025
+
+The paragraph above is the honest end of the wire story, and it is not the end
+of the section, because **nothing downstream of `collect` cares where the posts
+came from**. The `w1` tree, the minute-candle judge, the arms and the
+breakdowns need `Article`s with a timestamp and nothing else. So a corpus
+somebody collected under their own licence and handed over as a file drops
+straight in, and `fx/posts.py` is that door.
+
+The first one through it is the **Truth Social archive for 2025**, scraped from
+trumpstruth.org by the user. It arrives as two JSON Lines captures of the same
+thing plus a CSV of the first, and all three are read:
+
+| shape | keys that matter |
+|---|---|
+| *posts* | `status_id`, `text`, `date_published` (ISO, UTC, to the second), `original_url`, `archive_url` |
+| *statuses* | `status_id`, `article_body`, `headline` (`Donald J. Trump: "…"`), `date_published`, `url` |
+| CSV | the posts shape, **with a BOM on the first header** — read `utf-8-sig` or the first column is named `﻿post_id` and every lookup of `post_id` silently misses |
+
+**Three things about the files were counted rather than taken on trust, and
+each of them contradicts what the import was specified from.** The posts file is
+6,683 lines but only **6,120 distinct `status_id`** — 563 ids appear exactly
+twice, with identical text, so the dedupe loses nothing. The statuses file is
+6,120 lines covering *exactly* the same ids: it is a deduplicated second
+capture, not extra coverage. And it **cannot fill a single missing text** —
+both captures are missing the same 1,305 posts, the media-only ones and the
+reposts, so the fill rule is implemented (it is the right rule for two captures
+of one archive) and reports that it fired **zero** times rather than the code
+pretending otherwise.
+
+What is left is **4,815 posts with text**, 2025-01-01 to 2026-01-10, median 154
+characters. A post with no text is dropped rather than read as an empty
+document: a reader handed nothing will still answer something, and that answer
+would be about the reader.
+
+```
+4815 posts with text from 12,803 lines in 2 file(s): 6120 distinct ids
+(6683 rows merged into an id already seen), 0 texts filled from a second capture,
+1305 dropped for having no text, 0 for having no timestamp, 0 unreadable rows;
+median 154 characters
+  per month: 2025-01 358, 2025-02 386, 2025-03 539, 2025-04 342, 2025-05 386,
+  2025-06 415, 2025-07 430, 2025-08 464, 2025-09 275, 2025-10 340, 2025-11 493,
+  2025-12 386, 2026-01 1
+```
+
+**The files stay where they are.** They are read by path, never copied into this
+repository and never committed; the import writes the extracted fields into the
+cache under `wire:posts:{status_id}`, which is deliberately *not* the wire's own
+`wire:article:{url}` namespace — a cache filled from a file must not be
+indistinguishable from one filled from the network.
+
+**`--posts` does not consult `robots.txt` at all**, and that is the point rather
+than a shortcut. That file governs crawling a site; there is no site here, no
+request is made, and reading a corpus somebody already has is not a request to
+anybody. The run is offline end to end, and a test proves it by making any wire
+fetch raise.
+
+**The weekend is the caveat this corpus carries and the wire does not.** A wire
+posts when the market is open because that is when there is anything to report.
+These posts land whenever they were written: **1,062 of the 4,815 are at a
+weekend in UTC**, and spot FX is shut from about Friday 21:00 to Sunday 21:00.
+Those cannot be graded — not scored zero, not carried forward to Monday — so the
+run prints what the tape *could not* price beside what it could, per arm:
+
+```
+what the tape could and could not price (spot FX shuts Fri ~21:00 - Sun ~21:00 UTC):
+  reader >=0.15   274 signals, 211 the tape could price, 63 it could not
+                  (46 posted at a weekend, 17 on a weekday — a holiday, a Friday
+                  evening, or an hour with no bars)
+```
+
+"The tape was shut" and "the reader stayed out" are different findings and only
+one of them is about the reader, so they are never added together, and a
+weekday/weekend breakdown sits beside the session one.
+
+```bash
+python -m jevtrade.cli fx --wire --posts trumpstruth_posts.jsonl trumpstruth_statuses.jsonl \
+    --since 2025-01-01 --until 2025-12-31 --provider jev --sample 1000 \
+    --horizons 1,5,15,30,60 --latency 1 --out runs/fx-posts-2025.json
+
+python -m jevtrade.cli fx --wire --posts trumpstruth_posts.csv --collect-only   # import and stop
+```
+
+Offline (`--provider mock`) the whole thing runs in **1 m 44 s** over 4,814
+posts on the warmed 2025 candles, which is the shape of the real run without
+the reading: 274 reader signals, 211 of them priced, 61 posts where counting
+words and reading them traded differently. The offline reader is the keyword
+bot in the tree's clothes and its numbers mean nothing; what the smoke
+establishes is that the corpus, the judge and every table line up.
+
+**The run has not been done yet; the numbers will go here when it has.**
+
 ### What this does not show
 
 **Feed latency is the real bottleneck, and this study cannot measure it.** A
@@ -1912,7 +2004,7 @@ check that nothing here is rigged.
 ## Testing
 
 ```bash
-python -m pytest -q      # 448 tests
+python -m pytest -q      # 472 tests
 ```
 
 They cover the documented request/response schema, each policy gate, position
@@ -1964,6 +2056,7 @@ change on the site's side fails a test instead of quietly starting a scrape.
 | `fx/http.py` | one kept-open TLS connection per worker, shared by every FX fetch |
 | `fx/candles.py` | Dukascopy 1-minute candles: the cheap judge, and the padded weekend |
 | `fx/wire.py` | investinglive.com: the robots gate, the sitemaps, the JSON-LD |
+| `fx/posts.py` | a post archive the user brought, read into the same `Article` |
 | `fx/context.py` | the pre-release context, every item stamped and checked |
 | `fx/dots.py` | the SEP histogram, the median, the rule and the forward register |
 | `fx/presser.py` | the press-conference transcript, split at the first question |

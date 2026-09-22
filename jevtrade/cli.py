@@ -1598,6 +1598,7 @@ def cmd_fx_wire(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from .fx import candles as C
+    from .fx import posts as PS
     from .fx import reader as R
     from .fx import study as S
     from .fx import wire as W
@@ -1626,40 +1627,62 @@ def cmd_fx_wire(args: argparse.Namespace) -> int:
             print(f"  {symbol}: {have}/{want} files on disk")
         return 0
 
-    # ---- who may read this wire, asked before anything is fetched
-    try:
-        verdict = W.check(store, "/news/")
-        index_verdict = W.check(store, "/articles-sitemap-index.xml")
-    except Exception as exc:  # noqa: BLE001 -- unreachable robots is not permission
-        print(f"{W.ROBOTS_URL}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        print("robots.txt could not be read, which is not permission. Nothing fetched.")
-        return 3
-    print(f"robots.txt: articles {'allowed' if verdict.allowed else 'DISALLOWED'}"
-          f"{'' if verdict.allowed else ' for ' + verdict.blocked_by + ' (' + verdict.rule + ')'}"
-          f"; sitemaps {'allowed' if index_verdict.allowed else 'DISALLOWED'}")
-    offline = not (verdict.allowed and index_verdict.allowed)
-    if offline:
-        print("\nThe wire names AI agents in robots.txt and disallows them. This is an AI")
-        print("agent doing a bulk fetch, so the rule binds whatever User-Agent header it")
-        print("would send, and nothing will be fetched from it. --warm-candles still")
-        print("works: the price feed is a different host with no such rule.")
-        if not store.get("wire:index")[0]:
-            print("No cached corpus either, so there is nothing to read. Stopping.")
+    robots: dict[str, Any] = {"consulted": False}
+    if args.posts:
+        # A file the user brought. Nothing is fetched, so ``robots.txt`` is not
+        # consulted at all: it governs crawling a site, and there is no site
+        # here. Reading somebody's own corpus is not a request to anybody.
+        print(f"corpus: {len(args.posts)} local file(s); no wire request is made, "
+              f"so robots.txt is not consulted")
+        articles, post_coverage = PS.import_posts(store, args.posts, since, until,
+                                                  body_chars=args.body_chars)
+        print(post_coverage.summary())
+        where = PS.per_weekday(articles)
+        print(f"  in the window: {len(articles)} posts, {where['weekday']} on a "
+              f"weekday, {where['weekend']} at a weekend (UTC)")
+        if args.collect_only:
+            return 0
+        if not articles:
+            print("no posts in range", file=sys.stderr)
+            return 1
+    else:
+        # ---- who may read this wire, asked before anything is fetched
+        try:
+            verdict = W.check(store, "/news/")
+            index_verdict = W.check(store, "/articles-sitemap-index.xml")
+        except Exception as exc:  # noqa: BLE001 -- unreachable robots is not permission
+            print(f"{W.ROBOTS_URL}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print("robots.txt could not be read, which is not permission. Nothing fetched.")
             return 3
-        print("A cached corpus is present, so the run continues against it and sends no")
-        print("requests to the wire at all.")
+        allowed, blocked = verdict.allowed, verdict.blocked_by
+        robots = {"consulted": True, "articles_allowed": allowed,
+                  "blocked_by": blocked, "rule": verdict.rule}
+        print(f"robots.txt: articles {'allowed' if allowed else 'DISALLOWED'}"
+              f"{'' if allowed else ' for ' + blocked + ' (' + verdict.rule + ')'}"
+              f"; sitemaps {'allowed' if index_verdict.allowed else 'DISALLOWED'}")
+        offline = not (allowed and index_verdict.allowed)
+        if offline:
+            print("\nThe wire names AI agents in robots.txt and disallows them. This is an AI")
+            print("agent doing a bulk fetch, so the rule binds whatever User-Agent header it")
+            print("would send, and nothing will be fetched from it. --warm-candles still")
+            print("works: the price feed is a different host with no such rule.")
+            if not store.get("wire:index")[0]:
+                print("No cached corpus either, so there is nothing to read. Stopping.")
+                return 3
+            print("A cached corpus is present, so the run continues against it and sends no")
+            print("requests to the wire at all.")
 
-    # ---- the corpus
-    articles, coverage = W.collect(store, since, until, workers=min(args.workers_io, 4),
-                                   limit=args.limit, offline=offline)
-    print(coverage.summary())
-    if args.collect_only:
-        weeks = W.per_week(articles)
-        if weeks:
-            counts = sorted(weeks.values())
-            print(f"  {len(weeks)} ISO weeks, {counts[0]} to {counts[-1]} posts a week, "
-                  f"median {counts[len(counts) // 2]}")
-        return 0
+        articles, coverage = W.collect(store, since, until,
+                                       workers=min(args.workers_io, 4),
+                                       limit=args.limit, offline=offline)
+        print(coverage.summary())
+        if args.collect_only:
+            weeks = W.per_week(articles)
+            if weeks:
+                counts = sorted(weeks.values())
+                print(f"  {len(weeks)} ISO weeks, {counts[0]} to {counts[-1]} posts a "
+                      f"week, median {counts[len(counts) // 2]}")
+            return 0
     if not articles:
         print("no articles in range", file=sys.stderr)
         return 1
@@ -1749,6 +1772,13 @@ def cmd_fx_wire(args: argparse.Namespace) -> int:
             print(f"  ({s_row.note})")
 
     reader_outcomes = per_arm[0]
+    shut = [WS.shut_out(signals, outcomes)
+            for (_n, signals, _t), outcomes in zip(arms, per_arm)]
+    print("\nwhat the tape could and could not price (spot FX shuts Fri ~21:00 - "
+          "Sun ~21:00 UTC):")
+    for (name, _signals, _note), row in zip(arms, shut):
+        print(f"  {name:<22}{row.summary()}")
+
     print("\nwhat the reader made of the wire:")
     for field_name in ("category", "currency", "direction"):
         print(f"  {field_name}: " + ", ".join(
@@ -1766,6 +1796,7 @@ def cmd_fx_wire(args: argparse.Namespace) -> int:
         ("reader, scheduled", WS.by_reading(reader_outcomes, readings, "scheduled")),
         ("reader, is_number", WS.by_reading(reader_outcomes, readings, "is_number")),
         ("reader, by session (UTC)", WS.by_session),
+        ("reader, weekday or weekend", WS.by_weekday),
         ("reader, by pair", WS.by_pair),
     ):
         rows = WS.breakdown(reader_outcomes, key, horizons=report)
@@ -1842,9 +1873,12 @@ def cmd_fx_wire(args: argparse.Namespace) -> int:
             "latency_s": args.latency, "threshold": args.threshold,
             "horizons": list(horizons), "body_chars": args.body_chars,
             "sample": args.sample,
-            "robots": {"articles_allowed": verdict.allowed,
-                       "blocked_by": verdict.blocked_by, "rule": verdict.rule},
-            "coverage": asdict(coverage),
+            "robots": robots,
+            "corpus": ("posts-file" if args.posts else "wire"),
+            "posts_files": [str(f) for f in (args.posts or [])],
+            "coverage": asdict(post_coverage if args.posts else coverage),
+            "shut": [{"arm": name, **asdict(row)}
+                     for (name, _s, _t), row in zip(arms, shut)],
             "arms": [
                 {"name": s.name, "signals": s.signals, "measured": s.measured,
                  "note": s.note, "pre": asdict(s.pre), "spread": asdict(s.spread),
@@ -2329,6 +2363,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="store this week's calendar so the surprise arm can run later")
     fx.add_argument("--wire", action="store_true",
                     help="read investinglive.com's FX wire, graded on 1-minute candles")
+    fx.add_argument("--posts", nargs="+", default=[], metavar="FILE",
+                    help="--wire: read a local post archive (jsonl or csv) instead of "
+                         "fetching; no request is made, so robots.txt is not consulted")
     fx.add_argument("--collect-only", action="store_true",
                     help="--wire: scrape and cache the articles, print the summary, stop")
     fx.add_argument("--warm-candles", action="store_true",

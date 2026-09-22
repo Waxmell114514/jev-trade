@@ -43,6 +43,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from ..listing.store import Store
 from . import candles as C
+from . import posts as P
 from . import wire as W
 from .reader import Verdict, WireReader, WireReading, wire_signed_pair
 from .study import INPUT_USD_PER_MTOK, Outcome, Signal, Stat, _stat
@@ -407,6 +408,67 @@ def by_session(outcome: Outcome) -> str:
     return W.sessions(outcome.signal.ts)
 
 
+def by_weekday(outcome: Outcome) -> str:
+    """Weekday or weekend, by the UTC day the signal was posted on.
+
+    This is the *post's* day and not the tape's state: spot FX shuts about
+    Friday 21:00 UTC and reopens Sunday 21:00, which is not the same span. The
+    two questions are answered separately -- this table splits what was traded,
+    and ``Shut`` below counts what could not be.
+    """
+    return P.weekday_label(outcome.signal.ts)
+
+
+@dataclass
+class Shut:
+    """Signals the judge could not measure, split by when they were posted.
+
+    A corpus that arrives on a wire lands mostly in the session; a corpus of
+    somebody's posts lands whenever they wrote. "The tape was shut" and "the
+    reader stayed out" are different findings and only one of them is about the
+    reader, so they are never added together.
+    """
+
+    signals: int = 0
+    measured: int = 0
+    posted_weekday: int = 0
+    posted_weekend: int = 0
+    unmeasured_weekday: int = 0
+    unmeasured_weekend: int = 0
+
+    @property
+    def unmeasured(self) -> int:
+        return self.signals - self.measured
+
+    def summary(self) -> str:
+        return (
+            f"{self.signals} signals, {self.measured} the tape could price, "
+            f"{self.unmeasured} it could not "
+            f"({self.unmeasured_weekend} posted at a weekend, "
+            f"{self.unmeasured_weekday} on a weekday -- a holiday, a Friday "
+            f"evening, or an hour with no bars)"
+        )
+
+
+def shut_out(signals: Sequence[Signal], outcomes: Sequence[Outcome]) -> Shut:
+    """Which signals never became outcomes, and when they had been posted."""
+    priced = {(o.signal.code, o.signal.pair) for o in outcomes}
+    out = Shut(signals=len(signals), measured=len(outcomes))
+    for signal in signals:
+        weekend = P.is_weekend(signal.ts)
+        if weekend:
+            out.posted_weekend += 1
+        else:
+            out.posted_weekday += 1
+        if (signal.code, signal.pair) in priced:
+            continue
+        if weekend:
+            out.unmeasured_weekend += 1
+        else:
+            out.unmeasured_weekday += 1
+    return out
+
+
 def by_pair(outcome: Outcome) -> str:
     return outcome.signal.pair
 
@@ -513,9 +575,9 @@ def median_body(articles: Sequence[W.Article]) -> int:
 
 __all__ = [
     "Abstention", "Cell", "DEFAULT_SAMPLE", "HORIZONS", "REPORT_HORIZONS",
-    "SweepRow", "abstentions", "answer_counts", "breakdown", "by_pair",
-    "by_reading", "by_session", "cell", "cost_usd", "header", "keyword_signals",
-    "latency_sweep", "measure", "median_body", "null_signals", "read_all",
-    "reader_signals", "reading_from_dict", "reading_to_dict", "sample_signals",
-    "state_hash",
+    "Shut", "SweepRow", "abstentions", "answer_counts", "breakdown", "by_pair",
+    "by_reading", "by_session", "by_weekday", "cell", "cost_usd", "header",
+    "keyword_signals", "latency_sweep", "measure", "median_body", "null_signals",
+    "read_all", "reader_signals", "reading_from_dict", "reading_to_dict",
+    "sample_signals", "shut_out", "state_hash",
 ]
