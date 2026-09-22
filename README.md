@@ -1855,7 +1855,8 @@ disk, and none of it needs fetching again.
   USDCAD 730/730   USDCHF 730/730   NZDUSD 730/730
 ```
 
-**The run has not been done yet; the numbers will go here when it has.** The
+**The run on the wire itself has not been done, and will not be from here: its
+robots.txt names AI agents and disallows them, so no article was fetched.** The
 judge is warmed and the whole scoring path has been exercised against it — a
 synthetic corpus of sixty posts over the real April 2025 candles measures,
 places its nulls and fills every breakdown, at an average entry spread of 0.5
@@ -1955,7 +1956,54 @@ words and reading them traded differently. The offline reader is the keyword
 bot in the tree's clothes and its numbers mean nothing; what the smoke
 establishes is that the corpus, the judge and every table line up.
 
-**The run has not been done yet; the numbers will go here when it has.**
+**The run (real model, 4,814 posts, minute bars).** Run on 2026-09-22 with
+`--provider jev --sample 1000`: 4,814 posts read (median 154 characters, up to
+3,000 in the state), **31 went to round two, median 415 ms per post, $0.352**
+for the lot — about 1,765 input tokens a post, the nine-question state being
+most of it. Graded on the seven pairs' 2025 minute bars, entry at the next
+minute's open one second after the post, paying the ask or the bid.
+
+```
+arm                    signals traded    pre  sprd      +5m     +15m     +30m     +60m  hit15    z15
+reader >=0.15                0      0     +0   0.0       +0       +0       +0       +0      -      -
+keyword-bot                335    260     +1   0.5       -0       -0       -1       -1    43%   -0.8
+  s.e.                                                  +-0      +-0      +-1      +-1
+wire-sample                 62     51     +2   0.5       -0       -0       +0       +0    35%   +0.2
+
+what the reader made of it: politics_or_trade 3386, other 1025, geopolitics 368,
+  market commentary 18, data release 15, central-bank speaker 2
+currency: none 4125, USD 636, CAD 14, CNY 11, GBP 7, EUR 5, JPY 4;  direction: none 4231, stronger 338, weaker 245
+about_fx >= 0.5 on 43 posts (0.9%);  abstention at the trading threshold: 100% in every category
+shut out by the tape: 1,061 of 4,814 posts were written at a weekend; 54 of the keyword bot's 335 signals fell there
+```
+
+- **The reader traded nothing, and it was right not to.** It read 583 posts as
+  directional and 324 of those as being about a tradable currency, but called
+  the text *about a currency market* on 43 posts in the year and gave nearly
+  all of them a magnitude near the floor, so nothing reached the second round
+  with anything left to confirm. The keyword bot, which has no such qualms,
+  made 260 trades and came out at −0 ± 0 bp at fifteen minutes with a 43% hit
+  rate; the random sample of the corpus did the same.
+- **Without the gate the directions are still noise.** Rescoring the 265
+  directional reads the tape could price with no second round and no threshold:
+  −0.2 ± 0.5 bp at fifteen minutes, 49% right. Tariff posts (58): −0.4 ± 0.9,
+  43%. Posts about the Fed, Powell or rates (50): −0.0 ± 0.9, 46%. "USD
+  stronger" reads (168): −0.3 ± 0.5. The one subset that looks like anything,
+  magnitude ≥ 0.3 (22 posts, +4 ± 2 at fifteen minutes, 59%), is one cell of a
+  dozen looked at after the fact and is reported so nobody has to find it.
+- **The posts do not move the tape.** The unsigned EURUSD move in the fifteen
+  minutes after a directional post has a median of 2.8 bp; after four hundred
+  random non-directional posts, 2.5. The `pre` column is +0.6 bp: the market
+  was not moving into these posts either. Whatever moved the dollar on tariff
+  days in 2025 — the Rose Garden event, the executive orders, the wire reports
+  of them — it was not the moment a post appeared on this account, or the
+  post came after the tape already knew.
+
+So the first unscheduled, high-impact, minute-stamped text corpus this study
+has had says the same thing the scheduled one did, from the other side: on a
+stream where the words carry no direction, the reader's value was abstaining
+4,814 times for thirty-five cents, and the word-counter's cost was 260 trades
+that went nowhere.
 
 ### What this does not show
 
